@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::mem::size_of;
 
 use bytemuck::{Pod, Zeroable};
+use js_sys::{Array, Promise};
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
@@ -229,6 +230,34 @@ impl WasmFluidApp {
     #[wasm_bindgen(js_name = particleCount)]
     pub fn particle_count(&self) -> usize {
         self.simulation.particle_count()
+    }
+
+    #[wasm_bindgen(js_name = maxParticlesPerCell)]
+    pub fn max_particles_per_cell(&self) -> u32 {
+        self.simulation.max_particles_per_cell()
+    }
+
+    #[wasm_bindgen(js_name = readDiagnostics)]
+    pub fn read_diagnostics(&self) -> Promise {
+        let device = self.renderer.device().clone();
+        let queue = self.renderer.queue().clone();
+        let diagnostics_buffer = self.simulation.diagnostics_buffer();
+        let capacity = self.simulation.max_particles_per_cell();
+
+        wasm_bindgen_futures::future_to_promise(async move {
+            let diagnostics =
+                GpuFluidSimulation::read_diagnostics_buffer(&device, &queue, &diagnostics_buffer)
+                    .await
+                    .map_err(|error| JsValue::from_str(&error))?;
+
+            Ok(Array::of4(
+                &JsValue::from_f64(diagnostics.peak_cell_occupancy as f64),
+                &JsValue::from_f64(diagnostics.dropped_particles as f64),
+                &JsValue::from_f64(diagnostics.overflowed_cells as f64),
+                &JsValue::from_f64(capacity as f64),
+            )
+            .into())
+        })
     }
 
     #[wasm_bindgen(js_name = boundsWidth)]

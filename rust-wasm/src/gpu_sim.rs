@@ -1,12 +1,23 @@
 use std::borrow::Cow;
+#[cfg(target_arch = "wasm32")]
+use std::future::poll_fn;
 use std::f32::consts::PI;
 use std::mem::size_of;
+#[cfg(target_arch = "wasm32")]
+use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::{EPSILON, InteractionState, SimulationSettings, Vec2, build_spawn_points};
+use crate::{
+    EPSILON, InteractionState, SimulationSettings, Vec2, build_spawn_points,
+};
+#[cfg(test)]
+use crate::FluidSimulation;
 
 const NUM_THREADS: u32 = 64;
+const DIAGNOSTICS_WORDS: usize = 4;
 
 const COMPUTE_SHADER: &str = r#"
 const EPSILON: f32 = 1e-6;
@@ -49,7 +60,7 @@ var<storage, read_write> velocities_scratch: array<vec2<f32>>;
 @group(0) @binding(5)
 var<storage, read_write> densities: array<vec2<f32>>;
 @group(0) @binding(6)
-var<storage, read_write> cell_counts: array<atomic<u32>>;
+var<storage, read_write> grid_state: array<atomic<u32>>;
 @group(0) @binding(7)
 var<storage, read_write> cell_particles: array<u32>;
 @group(0) @binding(8)
@@ -77,6 +88,10 @@ fn grid_height() -> u32 {
 
 fn max_particles_per_cell() -> u32 {
     return uniforms.counts1.x;
+}
+
+fn grid_cell_count_index(cell_index: u32) -> u32 {
+    return 4u + cell_index;
 }
 
 fn target_density() -> f32 {
@@ -185,7 +200,10 @@ fn calculate_density(position: vec2<f32>) -> vec2<f32> {
         }
 
         let cell_index = flat_cell_index(neighbour_cell);
-        let count = min(atomicLoad(&cell_counts[cell_index]), max_particles_per_cell());
+        let count = min(
+            atomicLoad(&grid_state[grid_cell_count_index(cell_index)]),
+            max_particles_per_cell(),
+        );
         for (var slot = 0u; slot < count; slot += 1u) {
             let neighbour_index = cell_particles[cell_index * max_particles_per_cell() + slot];
             let neighbour_position = predicted_positions[neighbour_index];
@@ -239,11 +257,17 @@ fn handle_collisions(index: u32) {
 @compute @workgroup_size(64)
 fn clear_grid(@builtin(global_invocation_id) id: vec3<u32>) {
     let cell_index = id.x;
+    if (cell_index == 0u) {
+        atomicStore(&grid_state[0], 0u);
+        atomicStore(&grid_state[1], 0u);
+        atomicStore(&grid_state[2], 0u);
+        atomicStore(&grid_state[3], 0u);
+    }
     if (cell_index >= num_cells()) {
         return;
     }
 
-    atomicStore(&cell_counts[cell_index], 0u);
+    atomicStore(&grid_state[grid_cell_count_index(cell_index)], 0u);
 }
 
 @compute @workgroup_size(64)
@@ -271,9 +295,15 @@ fn build_grid(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let cell_index = flat_cell_index(cell);
-    let slot = atomicAdd(&cell_counts[cell_index], 1u);
+    let slot = atomicAdd(&grid_state[grid_cell_count_index(cell_index)], 1u);
+    atomicMax(&grid_state[0], slot + 1u);
     if (slot < max_particles_per_cell()) {
         cell_particles[cell_index * max_particles_per_cell() + slot] = index;
+    } else {
+        atomicAdd(&grid_state[1], 1u);
+        if (slot == max_particles_per_cell()) {
+            atomicAdd(&grid_state[2], 1u);
+        }
     }
 }
 
@@ -311,7 +341,10 @@ fn calculate_pressure(@builtin(global_invocation_id) id: vec3<u32>) {
         }
 
         let cell_index = flat_cell_index(neighbour_cell);
-        let count = min(atomicLoad(&cell_counts[cell_index]), max_particles_per_cell());
+        let count = min(
+            atomicLoad(&grid_state[grid_cell_count_index(cell_index)]),
+            max_particles_per_cell(),
+        );
         for (var slot = 0u; slot < count; slot += 1u) {
             let neighbour_index = cell_particles[cell_index * max_particles_per_cell() + slot];
             if (neighbour_index == index) {
@@ -369,7 +402,10 @@ fn calculate_viscosity(@builtin(global_invocation_id) id: vec3<u32>) {
         }
 
         let cell_index = flat_cell_index(neighbour_cell);
-        let count = min(atomicLoad(&cell_counts[cell_index]), max_particles_per_cell());
+        let count = min(
+            atomicLoad(&grid_state[grid_cell_count_index(cell_index)]),
+            max_particles_per_cell(),
+        );
         for (var slot = 0u; slot < count; slot += 1u) {
             let neighbour_index = cell_particles[cell_index * max_particles_per_cell() + slot];
             if (neighbour_index == index) {
@@ -433,6 +469,15 @@ struct SimulationUniforms {
     kernels1: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
+pub(crate) struct SimulationDiagnostics {
+    pub(crate) peak_cell_occupancy: u32,
+    pub(crate) dropped_particles: u32,
+    pub(crate) overflowed_cells: u32,
+    _reserved: u32,
+}
+
 pub(crate) struct GpuFluidSimulation {
     settings: SimulationSettings,
     initial_positions: Vec<[f32; 2]>,
@@ -450,7 +495,7 @@ pub(crate) struct GpuFluidSimulation {
     velocities: wgpu::Buffer,
     velocities_scratch: wgpu::Buffer,
     _densities: wgpu::Buffer,
-    _cell_counts: wgpu::Buffer,
+    grid_state: wgpu::Buffer,
     _cell_particles: wgpu::Buffer,
     render_data: wgpu::Buffer,
     clear_grid_pipeline: wgpu::ComputePipeline,
@@ -463,6 +508,7 @@ pub(crate) struct GpuFluidSimulation {
     prepare_render_data_pipeline: wgpu::ComputePipeline,
 }
 
+#[cfg_attr(test, allow(dead_code))]
 impl GpuFluidSimulation {
     pub(crate) fn new(
         device: &wgpu::Device,
@@ -524,10 +570,12 @@ impl GpuFluidSimulation {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let cell_counts = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("simulation cell counts"),
-            size: buffer_size::<u32>(num_cells as usize),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        let grid_state = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("simulation grid state"),
+            size: buffer_size::<u32>(num_cells as usize + DIAGNOSTICS_WORDS),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let cell_particles = device.create_buffer(&wgpu::BufferDescriptor {
@@ -541,10 +589,10 @@ impl GpuFluidSimulation {
             size: buffer_size::<[f32; 4]>(num_particles),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("simulation bind group layout"),
             entries: &[
@@ -569,7 +617,7 @@ impl GpuFluidSimulation {
                 buffer_entry(3, &velocities),
                 buffer_entry(4, &velocities_scratch),
                 buffer_entry(5, &densities),
-                buffer_entry(6, &cell_counts),
+                buffer_entry(6, &grid_state),
                 buffer_entry(7, &cell_particles),
                 buffer_entry(8, &render_data),
             ],
@@ -602,7 +650,7 @@ impl GpuFluidSimulation {
             velocities,
             velocities_scratch,
             _densities: densities,
-            _cell_counts: cell_counts,
+            grid_state,
             _cell_particles: cell_particles,
             render_data,
             clear_grid_pipeline: compute_pipeline(
@@ -692,8 +740,44 @@ impl GpuFluidSimulation {
         self.num_particles
     }
 
+    pub(crate) fn max_particles_per_cell(&self) -> u32 {
+        self.max_particles_per_cell
+    }
+
     pub(crate) fn render_buffer(&self) -> &wgpu::Buffer {
         &self.render_data
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn diagnostics_buffer(&self) -> wgpu::Buffer {
+        self.grid_state.clone()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn read_diagnostics_buffer(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        diagnostics: &wgpu::Buffer,
+    ) -> Result<SimulationDiagnostics, String> {
+        readback_value(device, queue, diagnostics).await
+    }
+
+    #[cfg(test)]
+    fn read_diagnostics_blocking(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<SimulationDiagnostics, String> {
+        readback_value_blocking(device, queue, &self.grid_state)
+    }
+
+    #[cfg(test)]
+    fn read_render_data_blocking(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Vec<[f32; 4]>, String> {
+        readback_vec_blocking(device, queue, &self.render_data, self.num_particles)
     }
 
     pub(crate) fn step_frame(
@@ -997,4 +1081,293 @@ fn estimate_max_particles_per_cell(
         .next_power_of_two()
         .min(initial_positions.len() as u32)
         .max(baseline)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn readback_value<T: Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+) -> Result<T, String> {
+    let size = size_of::<T>() as u64;
+    let download = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("simulation readback"),
+        size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("simulation readback encoder"),
+    });
+    encoder.copy_buffer_to_buffer(source, 0, &download, 0, size);
+    queue.submit(Some(encoder.finish()));
+
+    let state = Arc::new(Mutex::new(MapState::default()));
+    let state_for_callback = Arc::clone(&state);
+    download.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+        let mut state = state_for_callback
+            .lock()
+            .expect("map readback state lock poisoned");
+        state.result = Some(result.map_err(|error| error.to_string()));
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    });
+
+    poll_fn(|cx| {
+        let mut state = state.lock().expect("map readback state lock poisoned");
+        if let Some(result) = state.result.take() {
+            return std::task::Poll::Ready(result);
+        }
+        state.waker = Some(cx.waker().clone());
+        std::task::Poll::Pending
+    })
+    .await?;
+
+    let mapped = download.slice(..).get_mapped_range();
+    let value = *bytemuck::from_bytes::<T>(&mapped);
+    drop(mapped);
+    download.unmap();
+    Ok(value)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Default)]
+struct MapState {
+    result: Option<Result<(), String>>,
+    waker: Option<std::task::Waker>,
+}
+
+#[cfg(test)]
+fn readback_value_blocking<T: Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+) -> Result<T, String> {
+    let size = size_of::<T>() as u64;
+    let download = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("simulation readback"),
+        size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("simulation readback encoder"),
+    });
+    encoder.copy_buffer_to_buffer(source, 0, &download, 0, size);
+    queue.submit(Some(encoder.finish()));
+
+    let (sender, receiver) = mpsc::channel();
+    download.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result.map_err(|error| error.to_string()));
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|error| error.to_string())?;
+    receiver
+        .recv()
+        .map_err(|error| error.to_string())??;
+
+    let mapped = download.slice(..).get_mapped_range();
+    let value = *bytemuck::from_bytes::<T>(&mapped);
+    drop(mapped);
+    download.unmap();
+    Ok(value)
+}
+
+#[cfg(test)]
+fn readback_vec_blocking<T: Pod>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+    count: usize,
+) -> Result<Vec<T>, String> {
+    let size = buffer_size::<T>(count);
+    let download = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("simulation vector readback"),
+        size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("simulation vector readback encoder"),
+    });
+    encoder.copy_buffer_to_buffer(source, 0, &download, 0, size);
+    queue.submit(Some(encoder.finish()));
+
+    let (sender, receiver) = mpsc::channel();
+    download.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result.map_err(|error| error.to_string()));
+    });
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(|error| error.to_string())?;
+    receiver
+        .recv()
+        .map_err(|error| error.to_string())??;
+
+    let mapped = download.slice(..).get_mapped_range();
+    let values = bytemuck::cast_slice(&mapped).to_vec();
+    drop(mapped);
+    download.unmap();
+    Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::thread;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn gpu_matches_cpu_reference_for_test_a() {
+        let Some((device, queue)) = create_test_device() else {
+            eprintln!("Skipping GPU parity test because no headless wgpu adapter is available.");
+            return;
+        };
+        let settings = SimulationSettings::test_a();
+        let mut cpu = FluidSimulation::from_settings(settings.clone());
+        let mut gpu = GpuFluidSimulation::new(&device, &queue, settings);
+        let frame_times = [1.0 / 60.0, 1.0 / 55.0, 1.0 / 72.0];
+
+        for frame_time in frame_times {
+            cpu.step_frame(frame_time);
+            gpu.step_frame(&device, &queue, frame_time);
+        }
+
+        let mut cpu_particles = cpu
+            .render_data
+            .chunks_exact(4)
+            .map(|chunk| [chunk[0], chunk[1], chunk[2], chunk[3]])
+            .collect::<Vec<_>>();
+        let mut gpu_particles = gpu
+            .read_render_data_blocking(&device, &queue)
+            .expect("read GPU render data");
+
+        sort_particles(&mut cpu_particles);
+        sort_particles(&mut gpu_particles);
+        assert_eq!(cpu_particles.len(), gpu_particles.len());
+
+        let max_error = cpu_particles
+            .iter()
+            .zip(&gpu_particles)
+            .flat_map(|(cpu_particle, gpu_particle)| {
+                cpu_particle
+                    .iter()
+                    .zip(gpu_particle.iter())
+                    .map(|(cpu_value, gpu_value)| (cpu_value - gpu_value).abs())
+            })
+            .fold(0.0_f32, f32::max);
+
+        assert!(
+            max_error < 1.0e-3,
+            "GPU parity drifted too far from CPU reference: max error {max_error}"
+        );
+    }
+
+    #[test]
+    fn presets_do_not_overflow_grid_in_steady_state() {
+        let Some((device, queue)) = create_test_device() else {
+            eprintln!("Skipping GPU overflow test because no headless wgpu adapter is available.");
+            return;
+        };
+
+        for settings in [
+            SimulationSettings::test_a(),
+            SimulationSettings::test_b(),
+            SimulationSettings::test_c(),
+        ] {
+            let preset_name = settings.preset_name;
+            let mut gpu = GpuFluidSimulation::new(&device, &queue, settings);
+            for _ in 0..12 {
+                gpu.step_frame(&device, &queue, 1.0 / 60.0);
+            }
+
+            let diagnostics = gpu
+                .read_diagnostics_blocking(&device, &queue)
+                .expect("read diagnostics");
+            assert_eq!(
+                diagnostics.dropped_particles, 0,
+                "{preset_name} dropped particles during grid build"
+            );
+            assert_eq!(
+                diagnostics.overflowed_cells, 0,
+                "{preset_name} overflowed grid cells during grid build"
+            );
+            assert!(
+                diagnostics.peak_cell_occupancy <= gpu.max_particles_per_cell(),
+                "{preset_name} exceeded configured cell capacity"
+            );
+        }
+    }
+
+    fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::default();
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .ok()?;
+
+        block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("fluid-wasm test device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        }))
+        .ok()
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let parker = Arc::new(ThreadWaker {
+            thread: thread::current(),
+        });
+        let waker = Waker::from(parker);
+        let mut context = Context::from_waker(&waker);
+        let mut future = pin!(future);
+
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => thread::park_timeout(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    fn sort_particles(particles: &mut [[f32; 4]]) {
+        particles.sort_by(|left, right| compare_particle(left, right));
+    }
+
+    fn compare_particle(left: &[f32; 4], right: &[f32; 4]) -> Ordering {
+        for (lhs, rhs) in left.iter().zip(right.iter()) {
+            let ordering = lhs.total_cmp(rhs);
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        Ordering::Equal
+    }
+
+    struct ThreadWaker {
+        thread: thread::Thread,
+    }
+
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.thread.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.thread.unpark();
+        }
+    }
 }

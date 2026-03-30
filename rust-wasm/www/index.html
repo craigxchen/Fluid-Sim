@@ -39,15 +39,32 @@
             <dd id="fps">0</dd>
           </div>
           <div>
+            <dt>Sim CPU</dt>
+            <dd id="sim-cpu">0.00 ms</dd>
+          </div>
+          <div>
+            <dt>Render CPU</dt>
+            <dd id="render-cpu">0.00 ms</dd>
+          </div>
+          <div>
             <dt>Renderer</dt>
             <dd id="renderer">Loading...</dd>
+          </div>
+          <div>
+            <dt>Grid Peak</dt>
+            <dd id="grid-peak">0 / 0</dd>
+          </div>
+          <div>
+            <dt>Dropped</dt>
+            <dd id="grid-drops">0</dd>
           </div>
         </dl>
         <p class="hint">
           Left click attracts. Right click repels. Drag inside the canvas to
           perturb the flow. <code>Test C</code> is still the heaviest scenario,
           but it now executes on the GPU rather than the old CPU-side
-          Rust/WASM path.
+          Rust/WASM path. The extra counters show CPU submit cost plus grid
+          occupancy and overflow diagnostics from the compute solver.
         </p>
       </section>
       <section class="viewer">

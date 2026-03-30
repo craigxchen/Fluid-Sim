@@ -7,7 +7,11 @@ const presetSelect = document.getElementById("preset-select");
 const presetLabel = document.getElementById("preset");
 const particleLabel = document.getElementById("particles");
 const fpsLabel = document.getElementById("fps");
+const simCpuLabel = document.getElementById("sim-cpu");
+const renderCpuLabel = document.getElementById("render-cpu");
 const rendererLabel = document.getElementById("renderer");
+const gridPeakLabel = document.getElementById("grid-peak");
+const gridDropsLabel = document.getElementById("grid-drops");
 
 let app;
 let paused = false;
@@ -19,6 +23,19 @@ let pointerState = {
 };
 let lastFrameTime = 0;
 let fpsWindow = [];
+let simCpuWindow = [];
+let renderCpuWindow = [];
+let diagnosticsInFlight = false;
+let lastDiagnosticsSample = 0;
+
+function updateAverage(window, sample, maxSamples = 20) {
+  window.push(sample);
+  if (window.length > maxSamples) {
+    window.shift();
+  }
+
+  return window.reduce((sum, value) => sum + value, 0) / window.length;
+}
 
 function resizeCanvas() {
   const dpr = window.devicePixelRatio || 1;
@@ -61,13 +78,40 @@ function syncInteraction() {
 }
 
 function updateFps(frameTime) {
-  fpsWindow.push(frameTime);
-  if (fpsWindow.length > 20) {
-    fpsWindow.shift();
+  const average = updateAverage(fpsWindow, frameTime);
+  fpsLabel.textContent = average > 0 ? Math.round(1 / average).toString() : "0";
+}
+
+function updateCpuMetric(label, window, duration) {
+  const average = updateAverage(window, duration);
+  label.textContent = `${average.toFixed(2)} ms`;
+}
+
+async function pollDiagnostics(force = false) {
+  if (!app || diagnosticsInFlight) {
+    return;
   }
 
-  const average = fpsWindow.reduce((sum, value) => sum + value, 0) / fpsWindow.length;
-  fpsLabel.textContent = average > 0 ? Math.round(1 / average).toString() : "0";
+  const now = performance.now();
+  if (!force && now - lastDiagnosticsSample < 250) {
+    return;
+  }
+
+  diagnosticsInFlight = true;
+  lastDiagnosticsSample = now;
+
+  try {
+    const [peak, dropped, overflowedCells, capacity] = (
+      await app.readDiagnostics()
+    ).map((value) => Number(value));
+    gridPeakLabel.textContent = `${peak} / ${capacity}`;
+    gridDropsLabel.textContent =
+      dropped > 0 ? `${dropped} (${overflowedCells} cells)` : "0";
+  } catch (error) {
+    console.error("Failed to sample GPU diagnostics", error);
+  } finally {
+    diagnosticsInFlight = false;
+  }
 }
 
 function animate(timestamp) {
@@ -79,11 +123,16 @@ function animate(timestamp) {
   lastFrameTime = timestamp;
   updateFps(frameTime);
 
+  const simStart = performance.now();
   if (!paused) {
     app.stepFrame(frameTime);
   }
+  updateCpuMetric(simCpuLabel, simCpuWindow, performance.now() - simStart);
 
+  const renderStart = performance.now();
   app.render();
+  updateCpuMetric(renderCpuLabel, renderCpuWindow, performance.now() - renderStart);
+  void pollDiagnostics();
   requestAnimationFrame(animate);
 }
 
@@ -111,6 +160,8 @@ function syncUi() {
     app.particleCount(),
   );
   presetSelect.value = String(app.activePreset());
+  gridPeakLabel.textContent = `0 / ${app.maxParticlesPerCell()}`;
+  gridDropsLabel.textContent = "0";
 }
 
 canvas.addEventListener("contextmenu", (event) => event.preventDefault());
@@ -135,7 +186,12 @@ resetButton.addEventListener("click", () => {
   app.reset();
   paused = false;
   lastFrameTime = 0;
+  fpsWindow = [];
+  simCpuWindow = [];
+  renderCpuWindow = [];
+  lastDiagnosticsSample = 0;
   toggleButton.textContent = "Pause";
+  void pollDiagnostics(true);
 });
 
 presetSelect.addEventListener("change", (event) => {
@@ -149,9 +205,13 @@ presetSelect.addEventListener("change", (event) => {
   paused = false;
   lastFrameTime = 0;
   fpsWindow = [];
+  simCpuWindow = [];
+  renderCpuWindow = [];
+  lastDiagnosticsSample = 0;
   toggleButton.textContent = "Pause";
   syncUi();
   resizeCanvas();
+  void pollDiagnostics(true);
 });
 
 await init();
@@ -160,4 +220,5 @@ populatePresetOptions();
 syncUi();
 rendererLabel.textContent = "wgpu compute + render";
 resizeCanvas();
+void pollDiagnostics(true);
 requestAnimationFrame(animate);

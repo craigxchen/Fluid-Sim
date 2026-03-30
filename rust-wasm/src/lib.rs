@@ -2,7 +2,7 @@ use std::f32::consts::PI;
 
 use wasm_bindgen::prelude::*;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 mod gpu_sim;
 #[cfg(target_arch = "wasm32")]
 mod renderer;
