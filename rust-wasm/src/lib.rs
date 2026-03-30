@@ -2,6 +2,13 @@ use std::f32::consts::PI;
 
 use wasm_bindgen::prelude::*;
 
+#[cfg(target_arch = "wasm32")]
+mod gpu_sim;
+#[cfg(target_arch = "wasm32")]
+mod renderer;
+#[cfg(target_arch = "wasm32")]
+pub use renderer::WasmFluidApp;
+
 const PREDICTION_FACTOR: f32 = 1.0 / 120.0;
 const EPSILON: f32 = 1.0e-6;
 const PARTICLE_STRIDE: usize = 4;

@@ -14,7 +14,8 @@
         <p class="lede">
           This replaces the Unity runtime with a browser-first app. The current
           port mirrors the Unity 2D SPH solver for all three Unity test scenes
-          and renders them through a WebGL2 particle pipeline.
+          and now runs both the solver and particle rendering through Rust
+          `wgpu` pipelines.
         </p>
         <div class="controls">
           <button id="toggle">Pause</button>
@@ -44,8 +45,9 @@
         </dl>
         <p class="hint">
           Left click attracts. Right click repels. Drag inside the canvas to
-          perturb the flow. <code>Test C</code> is the heaviest CPU case because
-          the simulation still runs in Rust/WASM on the CPU.
+          perturb the flow. <code>Test C</code> is still the heaviest scenario,
+          but it now executes on the GPU rather than the old CPU-side
+          Rust/WASM path.
         </p>
       </section>
       <section class="viewer">

@@ -20,9 +20,9 @@ With thanks to the following papers:
 
 This repository now also contains a browser-first Rust/WASM implementation in [`rust-wasm`](./rust-wasm). The current port replaces the Unity runtime for all three 2D Unity test scenes with:
 
-* a Rust SPH solver that mirrors the Unity 2D compute pipeline on the CPU
+* a Rust `wgpu` SPH solver that mirrors the Unity 2D compute pipeline on the GPU
 * scenario switching for `Test A`, `Test B`, and `Test C`
-* a WebGL2 particle renderer for browser-side GPU drawing
+* a `wgpu` particle renderer that draws directly from GPU simulation buffers
 * mouse attraction/repulsion controls matching the Unity demo interaction model
 
 ### Run the browser version
