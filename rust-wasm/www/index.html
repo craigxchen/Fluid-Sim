@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fluid Sim WASM</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="intro">
+        <p class="eyebrow">Rust + WASM Browser Port</p>
+        <h1>Fluid Simulation</h1>
+        <p class="lede">
+          This replaces the Unity runtime with a browser-first app. The current
+          port mirrors the Unity 2D SPH solver for all three Unity test scenes
+          and renders them through a WebGL2 particle pipeline.
+        </p>
+        <div class="controls">
+          <button id="toggle">Pause</button>
+          <button id="reset">Reset</button>
+        </div>
+        <label class="preset-picker" for="preset-select">
+          <span>Scenario</span>
+          <select id="preset-select"></select>
+        </label>
+        <dl class="stats">
+          <div>
+            <dt>Preset</dt>
+            <dd id="preset">Loading...</dd>
+          </div>
+          <div>
+            <dt>Particles</dt>
+            <dd id="particles">0</dd>
+          </div>
+          <div>
+            <dt>FPS</dt>
+            <dd id="fps">0</dd>
+          </div>
+          <div>
+            <dt>Renderer</dt>
+            <dd id="renderer">Loading...</dd>
+          </div>
+        </dl>
+        <p class="hint">
+          Left click attracts. Right click repels. Drag inside the canvas to
+          perturb the flow. <code>Test C</code> is the heaviest CPU case because
+          the simulation still runs in Rust/WASM on the CPU.
+        </p>
+      </section>
+      <section class="viewer">
+        <canvas id="fluid-canvas"></canvas>
+      </section>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+  </html>

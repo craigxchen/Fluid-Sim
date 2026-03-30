@@ -69,3 +69,7 @@ crashlytics-build.properties
 # Temporary auto-generated Android Assets
 /[Aa]ssets/[Ss]treamingAssets/aa.meta
 /[Aa]ssets/[Ss]treamingAssets/aa/*
+
+# Rust/WASM browser port
+/rust-wasm/target/
+/rust-wasm/www/pkg/

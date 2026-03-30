@@ -15,3 +15,29 @@ With thanks to the following papers:
 * Rendering:
 * https://developer.download.nvidia.com/presentations/2010/gdc/Direct3D_Effects.pdf
 * https://cg.informatik.uni-freiburg.de/publications/2012_CGI_sprayFoamBubbles.pdf
+
+## Rust + WASM port
+
+This repository now also contains a browser-first Rust/WASM implementation in [`rust-wasm`](./rust-wasm). The current port replaces the Unity runtime for all three 2D Unity test scenes with:
+
+* a Rust SPH solver that mirrors the Unity 2D compute pipeline on the CPU
+* scenario switching for `Test A`, `Test B`, and `Test C`
+* a WebGL2 particle renderer for browser-side GPU drawing
+* mouse attraction/repulsion controls matching the Unity demo interaction model
+
+### Run the browser version
+
+From the repo root:
+
+```bash
+cd rust-wasm
+wasm-pack build --target web --out-dir www/pkg
+cd www
+python3 -m http.server 8080
+```
+
+Then open `http://localhost:8080`.
+
+### Migration status
+
+The browser port currently covers the 2D simulation path only. The Unity 3D features such as raymarching, foam particles, screen-space fluid rendering, and marching cubes still need to be ported separately.
