@@ -1,8 +1,9 @@
-import init, { WasmFluidApp } from "./pkg/fluid_wasm.js";
+import init, { WasmFluidApp, WasmFluid3DApp } from "./pkg/fluid_wasm.js";
 
 const canvas = document.getElementById("fluid-canvas");
 const toggleButton = document.getElementById("toggle");
 const resetButton = document.getElementById("reset");
+const modeSelect = document.getElementById("mode-select");
 const presetSelect = document.getElementById("preset-select");
 const presetLabel = document.getElementById("preset");
 const particleLabel = document.getElementById("particles");
@@ -12,14 +13,21 @@ const renderCpuLabel = document.getElementById("render-cpu");
 const rendererLabel = document.getElementById("renderer");
 const gridPeakLabel = document.getElementById("grid-peak");
 const gridDropsLabel = document.getElementById("grid-drops");
+const hintLabel = document.getElementById("mode-hint");
+
+const MODE_2D = "2d";
+const MODE_3D = "3d";
 
 let app;
+let activeMode = MODE_2D;
 let paused = false;
 let pointerState = {
   active: false,
   button: 0,
   worldX: 0,
   worldY: 0,
+  lastClientX: 0,
+  lastClientY: 0,
 };
 let lastFrameTime = 0;
 let fpsWindow = [];
@@ -27,6 +35,18 @@ let simCpuWindow = [];
 let renderCpuWindow = [];
 let diagnosticsInFlight = false;
 let lastDiagnosticsSample = 0;
+
+function is3dMode() {
+  return activeMode === MODE_3D;
+}
+
+function resetFrameStats() {
+  lastFrameTime = 0;
+  fpsWindow = [];
+  simCpuWindow = [];
+  renderCpuWindow = [];
+  lastDiagnosticsSample = 0;
+}
 
 function updateAverage(window, sample, maxSamples = 20) {
   window.push(sample);
@@ -62,6 +82,10 @@ function canvasToWorld(clientX, clientY) {
 }
 
 function syncInteraction() {
+  if (is3dMode()) {
+    return;
+  }
+
   if (!pointerState.active) {
     app.clearInteraction();
     return;
@@ -137,13 +161,41 @@ function animate(timestamp) {
 }
 
 function updatePointer(event) {
+  if (is3dMode()) {
+    if (pointerState.active) {
+      const dx = event.clientX - pointerState.lastClientX;
+      const dy = event.clientY - pointerState.lastClientY;
+      app.orbitCamera(dx, dy);
+    }
+    pointerState.lastClientX = event.clientX;
+    pointerState.lastClientY = event.clientY;
+    return;
+  }
+
   const world = canvasToWorld(event.clientX, event.clientY);
   pointerState.worldX = world.x;
   pointerState.worldY = world.y;
   syncInteraction();
 }
 
+function populateModeOptions() {
+  modeSelect.innerHTML = "";
+
+  const modes = [
+    { value: MODE_2D, label: "2D Solver" },
+    { value: MODE_3D, label: "3D Preview" },
+  ];
+
+  for (const mode of modes) {
+    const option = document.createElement("option");
+    option.value = mode.value;
+    option.textContent = mode.label;
+    modeSelect.append(option);
+  }
+}
+
 function populatePresetOptions() {
+  presetSelect.innerHTML = "";
   const count = app.presetCount();
 
   for (let index = 0; index < count; index += 1) {
@@ -160,20 +212,62 @@ function syncUi() {
     app.particleCount(),
   );
   presetSelect.value = String(app.activePreset());
-  gridPeakLabel.textContent = `0 / ${app.maxParticlesPerCell()}`;
-  gridDropsLabel.textContent = "0";
+  modeSelect.value = activeMode;
+  rendererLabel.textContent = app.rendererName();
+
+  if (is3dMode()) {
+    gridPeakLabel.textContent = `0 / ${app.maxParticlesPerCell()}`;
+    gridDropsLabel.textContent = "0";
+    hintLabel.innerHTML =
+      "Drag to orbit the camera and scroll to zoom. This 3D mode now runs a reduced-density GPU SPH solver with simple billboard rendering so the browser path stays focused on functional simulation rather than polished fluid shading. Watch <code>Grid Peak</code> and <code>Dropped</code> while switching presets.";
+  } else {
+    gridPeakLabel.textContent = `0 / ${app.maxParticlesPerCell()}`;
+    gridDropsLabel.textContent = "0";
+    hintLabel.innerHTML =
+      "Left click attracts. Right click repels. Drag inside the canvas to perturb the flow. <code>Oil &amp; Water</code> demonstrates immiscible multi-fluid simulation with two distinct fluid types that resist mixing. <code>Test C</code> is the heaviest single-fluid scenario. All presets run on the GPU compute solver.";
+  }
+}
+
+async function createApp(mode) {
+  activeMode = mode;
+  app = mode === MODE_3D
+    ? await WasmFluid3DApp.create(canvas)
+    : await WasmFluidApp.create(canvas);
+  pointerState.active = false;
+  paused = false;
+  diagnosticsInFlight = false;
+  toggleButton.textContent = "Pause";
+  populatePresetOptions();
+  syncUi();
+  resizeCanvas();
+  void pollDiagnostics(true);
 }
 
 canvas.addEventListener("contextmenu", (event) => event.preventDefault());
 canvas.addEventListener("pointerdown", (event) => {
   pointerState.active = true;
   pointerState.button = event.button;
+  pointerState.lastClientX = event.clientX;
+  pointerState.lastClientY = event.clientY;
   updatePointer(event);
 });
 canvas.addEventListener("pointermove", updatePointer);
+canvas.addEventListener(
+  "wheel",
+  (event) => {
+    if (!is3dMode()) {
+      return;
+    }
+    event.preventDefault();
+    app.zoomCamera(event.deltaY);
+  },
+  { passive: false },
+);
 window.addEventListener("pointerup", () => {
   pointerState.active = false;
-  app?.clearInteraction();
+  if (!is3dMode()) {
+    app?.clearInteraction();
+  }
 });
 window.addEventListener("resize", resizeCanvas);
 
@@ -184,14 +278,17 @@ toggleButton.addEventListener("click", () => {
 
 resetButton.addEventListener("click", () => {
   app.reset();
+  pointerState.active = false;
+  resetFrameStats();
   paused = false;
-  lastFrameTime = 0;
-  fpsWindow = [];
-  simCpuWindow = [];
-  renderCpuWindow = [];
-  lastDiagnosticsSample = 0;
   toggleButton.textContent = "Pause";
+  syncUi();
   void pollDiagnostics(true);
+});
+
+modeSelect.addEventListener("change", async (event) => {
+  resetFrameStats();
+  await createApp(event.target.value);
 });
 
 presetSelect.addEventListener("change", (event) => {
@@ -201,13 +298,11 @@ presetSelect.addEventListener("change", (event) => {
   }
 
   pointerState.active = false;
-  app.clearInteraction();
+  if (!is3dMode()) {
+    app.clearInteraction();
+  }
   paused = false;
-  lastFrameTime = 0;
-  fpsWindow = [];
-  simCpuWindow = [];
-  renderCpuWindow = [];
-  lastDiagnosticsSample = 0;
+  resetFrameStats();
   toggleButton.textContent = "Pause";
   syncUi();
   resizeCanvas();
@@ -215,10 +310,6 @@ presetSelect.addEventListener("change", (event) => {
 });
 
 await init();
-app = await WasmFluidApp.create(canvas);
-populatePresetOptions();
-syncUi();
-rendererLabel.textContent = "wgpu compute + render";
-resizeCanvas();
-void pollDiagnostics(true);
+populateModeOptions();
+await createApp(MODE_2D);
 requestAnimationFrame(animate);

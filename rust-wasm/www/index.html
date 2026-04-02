@@ -13,14 +13,19 @@
         <h1>Fluid Simulation</h1>
         <p class="lede">
           This replaces the Unity runtime with a browser-first app. The current
-          port mirrors the Unity 2D SPH solver for all three Unity test scenes
-          and now runs both the solver and particle rendering through Rust
-          `wgpu` pipelines.
+          port fully mirrors the Unity 2D SPH solver and now also includes a
+          reduced-density 3D GPU runtime for bring-up. Use the runtime switcher
+          to compare the stable 2D path with the first functional 3D browser
+          path.
         </p>
         <div class="controls">
           <button id="toggle">Pause</button>
           <button id="reset">Reset</button>
         </div>
+        <label class="preset-picker" for="mode-select">
+          <span>Runtime</span>
+          <select id="mode-select"></select>
+        </label>
         <label class="preset-picker" for="preset-select">
           <span>Scenario</span>
           <select id="preset-select"></select>
@@ -59,7 +64,7 @@
             <dd id="grid-drops">0</dd>
           </div>
         </dl>
-        <p class="hint">
+        <p class="hint" id="mode-hint">
           Left click attracts. Right click repels. Drag inside the canvas to
           perturb the flow. <code>Test C</code> is still the heaviest scenario,
           but it now executes on the GPU rather than the old CPU-side

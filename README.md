@@ -25,6 +25,13 @@ This repository now also contains a browser-first Rust/WASM implementation in [`
 * a `wgpu` particle renderer that draws directly from GPU simulation buffers
 * mouse attraction/repulsion controls matching the Unity demo interaction model
 
+The browser app now also includes a first 3D port slice:
+
+* Unity-derived 3D scene presets for the particle, raymarch, and marching-cubes scenes
+* a reduced-density Rust `wgpu` 3D SPH solver suitable for the browser bring-up phase
+* a simple `wgpu` billboard renderer with orbit camera controls for validating the live 3D simulation
+* shared browser UI that lets you switch between the completed 2D solver path and the new functional 3D runtime
+
 ### Run the browser version
 
 From the repo root:
@@ -40,4 +47,4 @@ Then open `http://localhost:8080`.
 
 ### Migration status
 
-The browser port currently covers the 2D simulation path only. The Unity 3D features such as raymarching, foam particles, screen-space fluid rendering, and marching cubes still need to be ported separately.
+The browser port fully covers the 2D simulation path. The 3D port now has a functional reduced-density GPU simulation with simple billboard rendering, but the higher-end Unity 3D features such as raymarching, foam particles, screen-space fluid rendering, and marching cubes still need to be ported separately.
