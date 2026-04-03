@@ -20,6 +20,8 @@ struct ParticleUniforms {
     bounds: vec2<f32>,
     radius: f32,
     padding: f32,
+    viewport: vec2<f32>,
+    _pad2: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -45,9 +47,11 @@ struct ParticleVertexOutput {
 @vertex
 fn vs_main(input: ParticleVertexInput) -> ParticleVertexOutput {
     let world = input.world_position + input.local * uniforms.radius;
+    let sim_aspect = uniforms.bounds.x / uniforms.bounds.y;
+    let canvas_aspect = uniforms.viewport.x / uniforms.viewport.y;
     let clip = vec2<f32>(
-        world.x / (uniforms.bounds.x * 0.5),
-        world.y / (uniforms.bounds.y * 0.5),
+        world.x / (uniforms.bounds.x * 0.5) * min(1.0, sim_aspect / canvas_aspect),
+        world.y / (uniforms.bounds.y * 0.5) * min(1.0, canvas_aspect / sim_aspect),
     );
 
     var output: ParticleVertexOutput;
@@ -210,6 +214,8 @@ struct ParticleUniforms {
     bounds: [f32; 2],
     radius: f32,
     padding: f32,
+    viewport: [f32; 2],
+    _pad2: [f32; 2],
 }
 
 #[repr(C)]
@@ -1167,6 +1173,8 @@ impl Renderer {
             ],
             radius: settings.render_radius,
             padding: 0.0,
+            viewport: [self.config.width.max(1) as f32, self.config.height.max(1) as f32],
+            _pad2: [0.0; 2],
         };
         self.queue.write_buffer(
             &self.particle_uniform_buffer,
@@ -1222,6 +1230,7 @@ impl Renderer {
         simulation: &GpuFluidSimulation,
     ) -> (Vec<ShapeVertex>, Vec<ShapeDrawCommand>) {
         let settings = simulation.settings();
+        let viewport = (self.config.width.max(1) as f32, self.config.height.max(1) as f32);
         let mut vertices = Vec::with_capacity(96);
         let mut commands = Vec::new();
 
@@ -1229,7 +1238,7 @@ impl Renderer {
             &mut vertices,
             &mut commands,
             ShapePipelineKind::Line,
-            &bounds_outline(settings.bounds_size),
+            &bounds_outline(settings.bounds_size, viewport),
             [0.08, 0.20, 0.28, 0.30],
         );
 
@@ -1239,14 +1248,14 @@ impl Renderer {
                 &mut vertices,
                 &mut commands,
                 ShapePipelineKind::Fill,
-                &obstacle_fill(settings.bounds_size, obstacle),
+                &obstacle_fill(settings.bounds_size, viewport, obstacle),
                 [0.05, 0.20, 0.28, 0.14],
             );
             self.push_shape(
                 &mut vertices,
                 &mut commands,
                 ShapePipelineKind::Line,
-                &obstacle_outline(settings.bounds_size, obstacle),
+                &obstacle_outline(settings.bounds_size, viewport, obstacle),
                 [0.05, 0.20, 0.28, 0.32],
             );
         }
@@ -1259,6 +1268,7 @@ impl Renderer {
                 ShapePipelineKind::Line,
                 &interaction_ring(
                     settings.bounds_size,
+                    viewport,
                     interaction,
                     settings.interaction_radius,
                 ),
@@ -1294,20 +1304,21 @@ impl Renderer {
     }
 }
 
-fn bounds_outline(bounds: Vec2) -> [[f32; 2]; 5] {
+fn bounds_outline(bounds: Vec2, viewport: (f32, f32)) -> [[f32; 2]; 5] {
     [
-        world_to_clip(bounds, Vec2::new(-bounds.x * 0.5, bounds.y * 0.5)),
-        world_to_clip(bounds, Vec2::new(bounds.x * 0.5, bounds.y * 0.5)),
-        world_to_clip(bounds, Vec2::new(bounds.x * 0.5, -bounds.y * 0.5)),
-        world_to_clip(bounds, Vec2::new(-bounds.x * 0.5, -bounds.y * 0.5)),
-        world_to_clip(bounds, Vec2::new(-bounds.x * 0.5, bounds.y * 0.5)),
+        world_to_clip(bounds, viewport, Vec2::new(-bounds.x * 0.5, bounds.y * 0.5)),
+        world_to_clip(bounds, viewport, Vec2::new(bounds.x * 0.5, bounds.y * 0.5)),
+        world_to_clip(bounds, viewport, Vec2::new(bounds.x * 0.5, -bounds.y * 0.5)),
+        world_to_clip(bounds, viewport, Vec2::new(-bounds.x * 0.5, -bounds.y * 0.5)),
+        world_to_clip(bounds, viewport, Vec2::new(-bounds.x * 0.5, bounds.y * 0.5)),
     ]
 }
 
-fn obstacle_fill(bounds: Vec2, obstacle: Obstacle) -> [[f32; 2]; 4] {
+fn obstacle_fill(bounds: Vec2, viewport: (f32, f32), obstacle: Obstacle) -> [[f32; 2]; 4] {
     [
         world_to_clip(
             bounds,
+            viewport,
             Vec2::new(
                 obstacle.centre.x - obstacle.size.x * 0.5,
                 obstacle.centre.y + obstacle.size.y * 0.5,
@@ -1315,6 +1326,7 @@ fn obstacle_fill(bounds: Vec2, obstacle: Obstacle) -> [[f32; 2]; 4] {
         ),
         world_to_clip(
             bounds,
+            viewport,
             Vec2::new(
                 obstacle.centre.x + obstacle.size.x * 0.5,
                 obstacle.centre.y + obstacle.size.y * 0.5,
@@ -1322,6 +1334,7 @@ fn obstacle_fill(bounds: Vec2, obstacle: Obstacle) -> [[f32; 2]; 4] {
         ),
         world_to_clip(
             bounds,
+            viewport,
             Vec2::new(
                 obstacle.centre.x - obstacle.size.x * 0.5,
                 obstacle.centre.y - obstacle.size.y * 0.5,
@@ -1329,55 +1342,61 @@ fn obstacle_fill(bounds: Vec2, obstacle: Obstacle) -> [[f32; 2]; 4] {
         ),
         world_to_clip(
             bounds,
+            viewport,
             Vec2::new(
                 obstacle.centre.x + obstacle.size.x * 0.5,
                 obstacle.centre.y - obstacle.size.y * 0.5,
-            ),
-        ),
-    ]
-}
-
-fn obstacle_outline(bounds: Vec2, obstacle: Obstacle) -> [[f32; 2]; 5] {
-    [
-        world_to_clip(
-            bounds,
-            Vec2::new(
-                obstacle.centre.x - obstacle.size.x * 0.5,
-                obstacle.centre.y + obstacle.size.y * 0.5,
-            ),
-        ),
-        world_to_clip(
-            bounds,
-            Vec2::new(
-                obstacle.centre.x + obstacle.size.x * 0.5,
-                obstacle.centre.y + obstacle.size.y * 0.5,
-            ),
-        ),
-        world_to_clip(
-            bounds,
-            Vec2::new(
-                obstacle.centre.x + obstacle.size.x * 0.5,
-                obstacle.centre.y - obstacle.size.y * 0.5,
-            ),
-        ),
-        world_to_clip(
-            bounds,
-            Vec2::new(
-                obstacle.centre.x - obstacle.size.x * 0.5,
-                obstacle.centre.y - obstacle.size.y * 0.5,
-            ),
-        ),
-        world_to_clip(
-            bounds,
-            Vec2::new(
-                obstacle.centre.x - obstacle.size.x * 0.5,
-                obstacle.centre.y + obstacle.size.y * 0.5,
             ),
         ),
     ]
 }
 
-fn interaction_ring(bounds: Vec2, interaction: InteractionState, radius: f32) -> Vec<[f32; 2]> {
+fn obstacle_outline(bounds: Vec2, viewport: (f32, f32), obstacle: Obstacle) -> [[f32; 2]; 5] {
+    [
+        world_to_clip(
+            bounds,
+            viewport,
+            Vec2::new(
+                obstacle.centre.x - obstacle.size.x * 0.5,
+                obstacle.centre.y + obstacle.size.y * 0.5,
+            ),
+        ),
+        world_to_clip(
+            bounds,
+            viewport,
+            Vec2::new(
+                obstacle.centre.x + obstacle.size.x * 0.5,
+                obstacle.centre.y + obstacle.size.y * 0.5,
+            ),
+        ),
+        world_to_clip(
+            bounds,
+            viewport,
+            Vec2::new(
+                obstacle.centre.x + obstacle.size.x * 0.5,
+                obstacle.centre.y - obstacle.size.y * 0.5,
+            ),
+        ),
+        world_to_clip(
+            bounds,
+            viewport,
+            Vec2::new(
+                obstacle.centre.x - obstacle.size.x * 0.5,
+                obstacle.centre.y - obstacle.size.y * 0.5,
+            ),
+        ),
+        world_to_clip(
+            bounds,
+            viewport,
+            Vec2::new(
+                obstacle.centre.x - obstacle.size.x * 0.5,
+                obstacle.centre.y + obstacle.size.y * 0.5,
+            ),
+        ),
+    ]
+}
+
+fn interaction_ring(bounds: Vec2, viewport: (f32, f32), interaction: InteractionState, radius: f32) -> Vec<[f32; 2]> {
     let mut vertices = Vec::with_capacity(INTERACTION_RING_SEGMENTS + 1);
     for index in 0..=INTERACTION_RING_SEGMENTS {
         let angle = index as f32 / INTERACTION_RING_SEGMENTS as f32 * std::f32::consts::TAU;
@@ -1385,15 +1404,17 @@ fn interaction_ring(bounds: Vec2, interaction: InteractionState, radius: f32) ->
             interaction.point.x + angle.cos() * radius,
             interaction.point.y + angle.sin() * radius,
         );
-        vertices.push(world_to_clip(bounds, world));
+        vertices.push(world_to_clip(bounds, viewport, world));
     }
     vertices
 }
 
-fn world_to_clip(bounds: Vec2, world: Vec2) -> [f32; 2] {
+fn world_to_clip(bounds: Vec2, viewport: (f32, f32), world: Vec2) -> [f32; 2] {
+    let sim_aspect = bounds.x / bounds.y.max(EPSILON);
+    let canvas_aspect = viewport.0 / viewport.1.max(EPSILON);
     [
-        world.x / (bounds.x.max(EPSILON) * 0.5),
-        world.y / (bounds.y.max(EPSILON) * 0.5),
+        world.x / (bounds.x.max(EPSILON) * 0.5) * (sim_aspect / canvas_aspect).min(1.0),
+        world.y / (bounds.y.max(EPSILON) * 0.5) * (canvas_aspect / sim_aspect).min(1.0),
     ]
 }
 

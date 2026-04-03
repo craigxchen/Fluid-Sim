@@ -70,14 +70,20 @@ function canvasToWorld(clientX, clientY) {
   const dpr = window.devicePixelRatio || 1;
   const px = (clientX - rect.left) * dpr;
   const py = (clientY - rect.top) * dpr;
-  const scale = Math.min(
-    canvas.width / app.boundsWidth(),
-    canvas.height / app.boundsHeight(),
-  ) * 0.9;
+
+  const bw = app.boundsWidth();
+  const bh = app.boundsHeight();
+  const simAspect = bw / bh;
+  const canvasAspect = canvas.width / canvas.height;
+
+  const scaleX = (canvasAspect > simAspect)
+    ? canvas.height / bh
+    : canvas.width / bw;
+  const scaleY = scaleX;
 
   return {
-    x: (px - canvas.width * 0.5) / scale,
-    y: (canvas.height * 0.5 - py) / scale,
+    x: (px - canvas.width * 0.5) / scaleX,
+    y: (canvas.height * 0.5 - py) / scaleY,
   };
 }
 
