@@ -53,6 +53,9 @@ struct SimulationUniforms3D {
     bounds1: vec4<f32>,
     kernels0: vec4<f32>,
     kernels1: vec4<f32>,
+    fluid0: vec4<f32>,
+    fluid1: vec4<f32>,
+    surface_tension: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -105,6 +108,55 @@ fn smoothing_radius() -> f32 {
 
 fn target_density() -> f32 {
     return uniforms.step1.x;
+}
+
+fn immiscibility_strength() -> f32 {
+    return uniforms.kernels1.y;
+}
+
+fn cylinder_radius() -> f32 {
+    return uniforms.kernels1.z;
+}
+
+fn fluid_target_density(ft: u32) -> f32 {
+    return select(uniforms.fluid1.x, uniforms.fluid0.x, ft == 0u);
+}
+
+fn fluid_pressure_multiplier(ft: u32) -> f32 {
+    return select(uniforms.fluid1.y, uniforms.fluid0.y, ft == 0u);
+}
+
+fn fluid_near_pressure_multiplier(ft: u32) -> f32 {
+    return select(uniforms.fluid1.z, uniforms.fluid0.z, ft == 0u);
+}
+
+fn fluid_viscosity(ft: u32) -> f32 {
+    return select(uniforms.fluid1.w, uniforms.fluid0.w, ft == 0u);
+}
+
+fn fluid_mass(ft: u32) -> f32 {
+    return fluid_target_density(ft) / max(uniforms.fluid0.x, EPSILON);
+}
+
+fn surface_tension_gamma(ft_a: u32, ft_b: u32) -> f32 {
+    if (ft_a == ft_b) {
+        return select(uniforms.surface_tension.y, uniforms.surface_tension.x, ft_a == 0u);
+    }
+    return uniforms.surface_tension.z;
+}
+
+fn akinci_cohesion_kernel(distance: f32, radius: f32) -> f32 {
+    if (distance >= radius || distance <= 0.0) {
+        return 0.0;
+    }
+    let coeff = 32.0 / (3.141592653589793 * pow(radius, 9.0));
+    let half_r = radius * 0.5;
+    if (distance > half_r) {
+        let d = radius - distance;
+        return coeff * d * d * d * distance * distance * distance;
+    }
+    let d = radius - distance;
+    return coeff * (2.0 * d * d * d * distance * distance * distance - pow(radius, 6.0) / 64.0);
 }
 
 fn grid_origin() -> vec3<f32> {
@@ -173,14 +225,6 @@ fn derivative_spiky_pow2(distance: f32, radius: f32) -> f32 {
     return 0.0;
 }
 
-fn pressure_from_density(density: f32) -> f32 {
-    return (density - uniforms.step1.x) * uniforms.step1.y;
-}
-
-fn near_pressure_from_density(near_density: f32) -> f32 {
-    return uniforms.step1.z * near_density;
-}
-
 fn calculate_density(position: vec3<f32>) -> vec2<f32> {
     let origin = get_cell(position);
     let radius = smoothing_radius();
@@ -209,8 +253,9 @@ fn calculate_density(position: vec3<f32>) -> vec2<f32> {
             }
 
             let distance = sqrt(sqr_dst);
-            density += spiky_kernel_pow2(distance, radius);
-            near_density += spiky_kernel_pow3(distance, radius);
+            let mass = fluid_mass(u32(positions[neighbour_index].w));
+            density += mass * spiky_kernel_pow2(distance, radius);
+            near_density += mass * spiky_kernel_pow3(distance, radius);
         }
     }
 
@@ -220,23 +265,51 @@ fn calculate_density(position: vec3<f32>) -> vec2<f32> {
 fn handle_collisions(index: u32) {
     var position = positions[index].xyz;
     var velocity = velocities[index].xyz;
+    let ft = positions[index].w;
+    let damping = uniforms.step0.z;
 
-    let half_bounds = uniforms.bounds0.xyz * 0.5;
-    let edge_distance = half_bounds - abs(position);
-    if (edge_distance.x <= 0.0) {
-        position.x = half_bounds.x * sign(position.x);
-        velocity.x *= -uniforms.step0.z;
-    }
-    if (edge_distance.y <= 0.0) {
-        position.y = half_bounds.y * sign(position.y);
-        velocity.y *= -uniforms.step0.z;
-    }
-    if (edge_distance.z <= 0.0) {
-        position.z = half_bounds.z * sign(position.z);
-        velocity.z *= -uniforms.step0.z;
+    let cyl_r = cylinder_radius();
+    if (cyl_r > 0.0) {
+        let half_height = uniforms.bounds0.y * 0.5;
+        if (position.y < -half_height) {
+            position.y = -half_height;
+            velocity.y *= -damping;
+        }
+        if (position.y > half_height) {
+            position.y = half_height;
+            velocity.y *= -damping;
+        }
+        let xz_dist = length(position.xz);
+        if (xz_dist > cyl_r) {
+            let xz_dir = position.xz / max(xz_dist, EPSILON);
+            position = vec3<f32>(xz_dir.x * cyl_r, position.y, xz_dir.y * cyl_r);
+            let radial_vel = dot(velocity.xz, xz_dir);
+            if (radial_vel > 0.0) {
+                velocity = vec3<f32>(
+                    velocity.x - xz_dir.x * radial_vel * (1.0 + damping),
+                    velocity.y,
+                    velocity.z - xz_dir.y * radial_vel * (1.0 + damping),
+                );
+            }
+        }
+    } else {
+        let half_bounds = uniforms.bounds0.xyz * 0.5;
+        let edge_distance = half_bounds - abs(position);
+        if (edge_distance.x <= 0.0) {
+            position.x = half_bounds.x * sign(position.x);
+            velocity.x *= -damping;
+        }
+        if (edge_distance.y <= 0.0) {
+            position.y = half_bounds.y * sign(position.y);
+            velocity.y *= -damping;
+        }
+        if (edge_distance.z <= 0.0) {
+            position.z = half_bounds.z * sign(position.z);
+            velocity.z *= -damping;
+        }
     }
 
-    positions[index] = vec4<f32>(position, 0.0);
+    positions[index] = vec4<f32>(position, ft);
     velocities[index] = vec4<f32>(velocity, 0.0);
 }
 
@@ -308,10 +381,14 @@ fn calculate_pressure(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    let density = max(densities[index].x, EPSILON);
-    let near_density = max(densities[index].y, EPSILON);
-    let pressure = pressure_from_density(density);
-    let near_pressure = near_pressure_from_density(near_density);
+    let my_type = u32(positions[index].w);
+    let my_density = max(densities[index].x, EPSILON);
+    let my_near_density = densities[index].y;
+    let my_target = fluid_target_density(my_type);
+    let my_mass = fluid_mass(my_type);
+    let pressure = (my_density - my_target) * fluid_pressure_multiplier(my_type);
+    let near_pressure = fluid_near_pressure_multiplier(my_type) * my_near_density;
+
     let position = predicted_positions[index].xyz;
     let origin = get_cell(position);
     let radius = smoothing_radius();
@@ -348,26 +425,25 @@ fn calculate_pressure(@builtin(global_invocation_id) id: vec3<u32>) {
                 offset_to_neighbour / max(distance, EPSILON),
                 distance > EPSILON,
             );
+            let neighbour_type = u32(positions[neighbour_index].w);
+            let mass = fluid_mass(neighbour_type);
             let neighbour_density = max(densities[neighbour_index].x, EPSILON);
-            let neighbour_near_density = max(densities[neighbour_index].y, EPSILON);
-            let neighbour_pressure = pressure_from_density(neighbour_density);
-            let neighbour_near_pressure = near_pressure_from_density(neighbour_near_density);
-            let shared_pressure = (pressure + neighbour_pressure) * 0.5;
-            let shared_near_pressure = (near_pressure + neighbour_near_pressure) * 0.5;
+            let neighbour_near_density = densities[neighbour_index].y;
+            let neighbour_pressure = (neighbour_density - fluid_target_density(neighbour_type)) * fluid_pressure_multiplier(neighbour_type);
+            let neighbour_near_pressure = fluid_near_pressure_multiplier(neighbour_type) * neighbour_near_density;
+            let density_ratio = fluid_target_density(neighbour_type) / max(my_target, EPSILON);
 
-            pressure_force += direction
-                * derivative_spiky_pow2(distance, radius)
-                * shared_pressure
-                / neighbour_density;
-            pressure_force += direction
-                * derivative_spiky_pow3(distance, radius)
-                * shared_near_pressure
-                / neighbour_near_density;
+            pressure_force += 0.5 * mass
+                * (pressure / (my_density * my_density) + density_ratio * neighbour_pressure / (neighbour_density * neighbour_density))
+                * derivative_spiky_pow2(distance, radius) * direction;
+
+            pressure_force += 0.5 * mass
+                * (near_pressure / (my_density * my_density) + density_ratio * neighbour_near_pressure / (neighbour_density * neighbour_density))
+                * derivative_spiky_pow3(distance, radius) * direction;
         }
     }
 
-    let next_velocity = velocities[index].xyz + pressure_force / density * uniforms.step0.y;
-    velocities_scratch[index] = vec4<f32>(next_velocity, 0.0);
+    velocities_scratch[index] = vec4<f32>(velocities[index].xyz + pressure_force * uniforms.step0.y, 0.0);
 }
 
 @compute @workgroup_size(64)
@@ -377,6 +453,8 @@ fn calculate_viscosity(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
+    let my_type = u32(positions[index].w);
+    let my_viscosity = fluid_viscosity(my_type);
     let position = predicted_positions[index].xyz;
     let origin = get_cell(position);
     let radius = smoothing_radius();
@@ -408,13 +486,95 @@ fn calculate_viscosity(@builtin(global_invocation_id) id: vec3<u32>) {
                 continue;
             }
 
+            let neighbour_type = u32(positions[neighbour_index].w);
+            let viscosity = select(my_viscosity * 0.1, my_viscosity, my_type == neighbour_type);
+            let mass = fluid_mass(neighbour_type);
             let distance = sqrt(sqr_dst);
             viscosity_force +=
-                (velocities_scratch[neighbour_index].xyz - velocity) * smoothing_kernel_poly6(distance, radius);
+                (velocities_scratch[neighbour_index].xyz - velocity)
+                * smoothing_kernel_poly6(distance, radius) * viscosity * mass;
         }
     }
 
-    velocities[index] = vec4<f32>(velocity + viscosity_force * uniforms.step1.w * uniforms.step0.y, 0.0);
+    velocities[index] = vec4<f32>(velocity + viscosity_force * uniforms.step0.y, 0.0);
+}
+
+@compute @workgroup_size(64)
+fn calculate_surface_tension(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x;
+    if (index >= num_particles()) {
+        return;
+    }
+
+    let my_type = u32(positions[index].w);
+    let my_mass = fluid_mass(my_type);
+    let my_density = max(densities[index].x, EPSILON);
+    let position = predicted_positions[index].xyz;
+    let origin = get_cell(position);
+    let radius = smoothing_radius();
+    let radius_sq = radius * radius;
+    var cohesion_force = vec3<f32>(0.0);
+    var normal = vec3<f32>(0.0);
+
+    for (var offset_index = 0u; offset_index < 27u; offset_index += 1u) {
+        let neighbour_cell = origin + NEIGHBOUR_OFFSETS[offset_index];
+        if (!cell_is_valid(neighbour_cell)) {
+            continue;
+        }
+
+        let cell_index = flat_cell_index(neighbour_cell);
+        let count = min(
+            atomicLoad(&grid_state[grid_cell_count_index(cell_index)]),
+            max_particles_per_cell(),
+        );
+        for (var slot = 0u; slot < count; slot += 1u) {
+            let neighbour_index = cell_particles[cell_index * max_particles_per_cell() + slot];
+            if (neighbour_index == index) {
+                continue;
+            }
+
+            let neighbour_position = predicted_positions[neighbour_index].xyz;
+            let offset_to_neighbour = neighbour_position - position;
+            let sqr_dst = dot(offset_to_neighbour, offset_to_neighbour);
+            if (sqr_dst > radius_sq) {
+                continue;
+            }
+
+            let distance = sqrt(sqr_dst);
+            let neighbour_type = u32(positions[neighbour_index].w);
+            let neighbour_mass = fluid_mass(neighbour_type);
+            let neighbour_density = max(densities[neighbour_index].x, EPSILON);
+            let gamma = surface_tension_gamma(my_type, neighbour_type);
+
+            if (gamma <= 0.0) {
+                continue;
+            }
+
+            let K = 2.0 * target_density() / max(my_density + neighbour_density, EPSILON);
+            let direction = select(
+                vec3<f32>(0.0, 1.0, 0.0),
+                offset_to_neighbour / max(distance, EPSILON),
+                distance > EPSILON,
+            );
+
+            cohesion_force -= gamma * my_mass * neighbour_mass
+                * akinci_cohesion_kernel(distance, radius) * direction * K;
+
+            normal += radius * (neighbour_mass / neighbour_density)
+                * derivative_spiky_pow2(distance, radius) * direction;
+        }
+    }
+
+    var curvature_force = vec3<f32>(0.0);
+    let normal_len = length(normal);
+    if (normal_len > EPSILON) {
+        curvature_force = -surface_tension_gamma(my_type, my_type) * normal;
+    }
+
+    velocities[index] = vec4<f32>(
+        velocities[index].xyz + (cohesion_force + curvature_force) * uniforms.step0.y,
+        0.0,
+    );
 }
 
 @compute @workgroup_size(64)
@@ -424,9 +584,15 @@ fn update_positions(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    positions[index] = vec4<f32>(positions[index].xyz + velocities[index].xyz * uniforms.step0.y, 0.0);
+    let ft = positions[index].w;
+    positions[index] = vec4<f32>(positions[index].xyz + velocities[index].xyz * uniforms.step0.y, ft);
     handle_collisions(index);
+    let speed_sq = dot(velocities[index].xyz, velocities[index].xyz);
+    let speed_bits = bitcast<u32>(speed_sq);
+    atomicMax(&grid_state[3], speed_bits);
 }
+
+const FLUID_TYPE_PACK_3D: f32 = 1024.0;
 
 @compute @workgroup_size(64)
 fn prepare_render_data(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -435,11 +601,13 @@ fn prepare_render_data(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
+    let ft = u32(positions[index].w);
+    let density_norm = densities[index].x / max(fluid_target_density(ft), EPSILON);
     render_data[index] = vec4<f32>(
         positions[index].x,
         positions[index].y,
         positions[index].z,
-        densities[index].x / max(target_density(), EPSILON),
+        density_norm + f32(ft) * FLUID_TYPE_PACK_3D,
     );
 }
 "#;
@@ -455,6 +623,9 @@ struct SimulationUniforms3D {
     bounds1: [f32; 4],
     kernels0: [f32; 4],
     kernels1: [f32; 4],
+    fluid0: [f32; 4],
+    fluid1: [f32; 4],
+    surface_tension: [f32; 4],
 }
 
 #[repr(C)]
@@ -463,13 +634,14 @@ pub(crate) struct SimulationDiagnostics3D {
     pub(crate) peak_cell_occupancy: u32,
     pub(crate) dropped_particles: u32,
     pub(crate) overflowed_cells: u32,
-    _reserved: u32,
+    pub(crate) max_speed_sq_bits: u32,
 }
 
 pub(crate) struct GpuFluidSimulation3D {
     settings: SimulationSettings3D,
     initial_positions: Vec<[f32; 4]>,
     initial_velocities: Vec<[f32; 4]>,
+    max_speed_sq: f32,
     num_particles: usize,
     num_cells: u32,
     grid_width: u32,
@@ -492,6 +664,7 @@ pub(crate) struct GpuFluidSimulation3D {
     calculate_densities_pipeline: wgpu::ComputePipeline,
     calculate_pressure_pipeline: wgpu::ComputePipeline,
     calculate_viscosity_pipeline: wgpu::ComputePipeline,
+    surface_tension_pipeline: wgpu::ComputePipeline,
     update_positions_pipeline: wgpu::ComputePipeline,
     prepare_render_data_pipeline: wgpu::ComputePipeline,
 }
@@ -505,8 +678,9 @@ impl GpuFluidSimulation3D {
         let spawn = build_spawn_points_3d(&settings.spawn);
         let initial_positions: Vec<[f32; 4]> = spawn
             .positions
-            .into_iter()
-            .map(|value| [value.x, value.y, value.z, 0.0])
+            .iter()
+            .zip(spawn.fluid_types.iter())
+            .map(|(pos, &ft)| [pos.x, pos.y, pos.z, ft as f32])
             .collect();
         let initial_velocities: Vec<[f32; 4]> = initial_positions
             .iter()
@@ -593,7 +767,6 @@ impl GpuFluidSimulation3D {
                 | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("simulation 3d bind group layout"),
             entries: &[
@@ -638,6 +811,7 @@ impl GpuFluidSimulation3D {
             settings,
             initial_positions,
             initial_velocities,
+            max_speed_sq: 0.0,
             num_particles,
             num_cells,
             grid_width,
@@ -690,6 +864,12 @@ impl GpuFluidSimulation3D {
                 &shader_module,
                 "calculate_viscosity",
             ),
+            surface_tension_pipeline: compute_pipeline(
+                device,
+                &pipeline_layout,
+                &shader_module,
+                "calculate_surface_tension",
+            ),
             update_positions_pipeline: compute_pipeline(
                 device,
                 &pipeline_layout,
@@ -726,6 +906,13 @@ impl GpuFluidSimulation3D {
         self.max_particles_per_cell
     }
 
+    pub(crate) fn update_max_speed(&mut self, diagnostics: &SimulationDiagnostics3D) {
+        self.max_speed_sq = f32::from_bits(diagnostics.max_speed_sq_bits);
+        if self.max_speed_sq.is_nan() || self.max_speed_sq.is_infinite() {
+            self.max_speed_sq = 0.0;
+        }
+    }
+
     pub(crate) fn render_buffer(&self) -> &wgpu::Buffer {
         &self.render_data
     }
@@ -740,6 +927,56 @@ impl GpuFluidSimulation3D {
         diagnostics: &wgpu::Buffer,
     ) -> Result<SimulationDiagnostics3D, String> {
         readback_value(device, queue, diagnostics).await
+    }
+
+    pub(crate) async fn read_render_data(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &wgpu::Buffer,
+        count: usize,
+    ) -> Result<Vec<f32>, String> {
+        let size = (count * 4 * size_of::<f32>()) as u64;
+        let download = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("render data readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("render data readback encoder"),
+        });
+        encoder.copy_buffer_to_buffer(source, 0, &download, 0, size);
+        queue.submit(Some(encoder.finish()));
+
+        let state = Arc::new(Mutex::new(MapState::default()));
+        let state_for_callback = Arc::clone(&state);
+        download
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let mut state = state_for_callback
+                    .lock()
+                    .expect("map readback state lock poisoned");
+                state.result = Some(result.map_err(|error| error.to_string()));
+                if let Some(waker) = state.waker.take() {
+                    waker.wake();
+                }
+            });
+
+        poll_fn(|cx| {
+            let mut state = state.lock().expect("map readback state lock poisoned");
+            if let Some(result) = state.result.take() {
+                return std::task::Poll::Ready(result);
+            }
+            state.waker = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        })
+        .await?;
+
+        let mapped = download.slice(..).get_mapped_range();
+        let data: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
+        drop(mapped);
+        download.unmap();
+        Ok(data)
     }
 
     pub(crate) fn step_frame(
@@ -757,7 +994,8 @@ impl GpuFluidSimulation3D {
         } else {
             f32::INFINITY
         };
-        let frame_delta = (frame_time * self.settings.time_scale).min(max_delta);
+        let frame_delta = (frame_time * self.settings.time_scale)
+            .min(max_delta);
         let iterations = self.settings.iterations_per_frame.max(1) as f32;
         let step_delta = frame_delta / iterations;
 
@@ -787,6 +1025,11 @@ impl GpuFluidSimulation3D {
                 self.encode_pipeline(
                     &mut pass,
                     &self.calculate_viscosity_pipeline,
+                    self.particle_workgroups(),
+                );
+                self.encode_pipeline(
+                    &mut pass,
+                    &self.surface_tension_pipeline,
                     self.particle_workgroups(),
                 );
                 self.encode_pipeline(
@@ -921,7 +1164,15 @@ impl GpuFluidSimulation3D {
                 15.0 / (2.0 * PI * radius.powi(5)),
                 45.0 / (PI * radius.powi(6)),
             ],
-            kernels1: [15.0 / (PI * radius.powi(5)), 0.0, 0.0, 0.0],
+            kernels1: [
+                15.0 / (PI * radius.powi(5)),
+                self.settings.immiscibility_strength,
+                self.settings.cylinder_radius,
+                0.0,
+            ],
+            fluid0: self.settings.fluid_type_uniform(0),
+            fluid1: self.settings.fluid_type_uniform(1),
+            surface_tension: self.settings.surface_tension_uniform(),
         };
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -1105,6 +1356,14 @@ struct MapState {
     waker: Option<std::task::Waker>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct FluidTypeProperties3D {
+    target_density: f32,
+    pressure_multiplier: f32,
+    near_pressure_multiplier: f32,
+    viscosity_strength: f32,
+}
+
 #[derive(Clone)]
 pub(crate) struct SimulationSettings3D {
     pub(crate) preset_name: &'static str,
@@ -1118,6 +1377,11 @@ pub(crate) struct SimulationSettings3D {
     pub(crate) pressure_multiplier: f32,
     pub(crate) near_pressure_multiplier: f32,
     pub(crate) viscosity_strength: f32,
+    pub(crate) immiscibility_strength: f32,
+    pub(crate) cylinder_radius: f32,
+    pub(crate) fluid_type_properties: Vec<FluidTypeProperties3D>,
+    pub(crate) surface_tension_same: [f32; 2],
+    pub(crate) surface_tension_cross: f32,
     pub(crate) bounds_size: Vec3,
     pub(crate) render_radius: f32,
     pub(crate) initial_velocity: Vec3,
@@ -1130,12 +1394,13 @@ impl SimulationSettings3D {
             0 => Some(Self::particles()),
             1 => Some(Self::raymarch()),
             2 => Some(Self::marching_cubes()),
+            3 => Some(Self::oil_and_water()),
             _ => None,
         }
     }
 
     pub(crate) fn preset_count() -> usize {
-        3
+        4
     }
 
     pub(crate) fn preset_name(index: usize) -> &'static str {
@@ -1143,8 +1408,36 @@ impl SimulationSettings3D {
             0 => "Unity 3D Particles",
             1 => "Unity 3D Raymarch",
             2 => "Unity 3D Marching Cubes",
+            3 => "3D Oil & Water",
             _ => "Unknown Preset",
         }
+    }
+
+    fn fluid_type_uniform(&self, index: usize) -> [f32; 4] {
+        if let Some(props) = self.fluid_type_properties.get(index) {
+            [
+                props.target_density,
+                props.pressure_multiplier,
+                props.near_pressure_multiplier,
+                props.viscosity_strength,
+            ]
+        } else {
+            [
+                self.target_density,
+                self.pressure_multiplier,
+                self.near_pressure_multiplier,
+                self.viscosity_strength,
+            ]
+        }
+    }
+
+    fn surface_tension_uniform(&self) -> [f32; 4] {
+        [
+            self.surface_tension_same[0],
+            self.surface_tension_same[1],
+            self.surface_tension_cross,
+            0.0,
+        ]
     }
 
     pub(crate) fn particles() -> Self {
@@ -1160,20 +1453,30 @@ impl SimulationSettings3D {
             pressure_multiplier: 230.0,
             near_pressure_multiplier: 2.0,
             viscosity_strength: 0.004,
+            immiscibility_strength: 0.0,
+            cylinder_radius: 0.0,
+            fluid_type_properties: vec![],
+            surface_tension_same: [0.0, 0.0],
+            surface_tension_cross: 0.0,
             bounds_size: Vec3::new(24.0, 10.0, 15.0),
             render_radius: 0.13,
             initial_velocity: Vec3::ZERO,
             spawn: SpawnSettings3D {
                 spawn_density: 80,
                 jitter_strength: 0.03,
+                cylinder_clip_radius: 0.0,
                 regions: vec![
                     SpawnRegion3D {
                         centre: Vec3::new(-8.3, -1.3, 3.65),
                         size: 7.0,
+                        height_override: 0.0,
+                        fluid_type: 0,
                     },
                     SpawnRegion3D {
                         centre: Vec3::new(-8.3, -1.3, -3.65),
                         size: 7.0,
+                        height_override: 0.0,
+                        fluid_type: 0,
                     },
                 ],
             },
@@ -1193,15 +1496,23 @@ impl SimulationSettings3D {
             pressure_multiplier: 230.0,
             near_pressure_multiplier: 2.0,
             viscosity_strength: 0.004,
+            immiscibility_strength: 0.0,
+            cylinder_radius: 0.0,
+            fluid_type_properties: vec![],
+            surface_tension_same: [0.0, 0.0],
+            surface_tension_cross: 0.0,
             bounds_size: Vec3::new(15.0, 10.0, 8.0),
             render_radius: 0.12,
             initial_velocity: Vec3::ZERO,
             spawn: SpawnSettings3D {
                 spawn_density: 72,
                 jitter_strength: 0.03,
+                cylinder_clip_radius: 0.0,
                 regions: vec![SpawnRegion3D {
                     centre: Vec3::new(-4.0, -1.42, 0.0),
                     size: 7.0,
+                    height_override: 0.0,
+                    fluid_type: 0,
                 }],
             },
         }
@@ -1220,16 +1531,84 @@ impl SimulationSettings3D {
             pressure_multiplier: 230.0,
             near_pressure_multiplier: 2.0,
             viscosity_strength: 0.004,
+            immiscibility_strength: 0.0,
+            cylinder_radius: 0.0,
+            fluid_type_properties: vec![],
+            surface_tension_same: [0.0, 0.0],
+            surface_tension_cross: 0.0,
             bounds_size: Vec3::new(16.0, 12.0, 8.0),
             render_radius: 0.12,
             initial_velocity: Vec3::ZERO,
             spawn: SpawnSettings3D {
                 spawn_density: 72,
                 jitter_strength: 0.03,
+                cylinder_clip_radius: 0.0,
                 regions: vec![SpawnRegion3D {
                     centre: Vec3::new(3.92, -1.94, 0.0),
                     size: 7.0,
+                    height_override: 0.0,
+                    fluid_type: 0,
                 }],
+            },
+        }
+    }
+
+    pub(crate) fn oil_and_water() -> Self {
+        let cylinder_r = 3.5;
+        let half_height = 5.0;
+        let num_layers = 8;
+        let layer_height = (half_height * 2.0) / num_layers as f32;
+        let layer_size = cylinder_r * 2.0;
+        let regions: Vec<SpawnRegion3D> = (0..num_layers)
+            .map(|i| {
+                let y = -half_height + layer_height * (i as f32 + 0.5);
+                SpawnRegion3D {
+                    centre: Vec3::new(0.0, y, 0.0),
+                    size: layer_size,
+                    height_override: layer_height,
+                    fluid_type: (i % 2) as u8,
+                }
+            })
+            .collect();
+
+        Self {
+            preset_name: "3D Oil & Water",
+            time_scale: 1.0,
+            max_timestep_fps: 60.0,
+            iterations_per_frame: 4,
+            gravity: -10.0,
+            collision_damping: 0.3,
+            smoothing_radius: 0.24,
+            target_density: 430.0,
+            pressure_multiplier: 230.0,
+            near_pressure_multiplier: 2.0,
+            viscosity_strength: 0.01,
+            immiscibility_strength: 0.0,
+            cylinder_radius: cylinder_r,
+            fluid_type_properties: vec![
+                FluidTypeProperties3D {
+                    target_density: 430.0,
+                    pressure_multiplier: 230.0,
+                    near_pressure_multiplier: 2.0,
+                    viscosity_strength: 0.008,
+                },
+                FluidTypeProperties3D {
+                    target_density: 370.0,
+                    pressure_multiplier: 230.0,
+                    near_pressure_multiplier: 2.0,
+                    viscosity_strength: 0.02,
+                },
+            ],
+            surface_tension_same: [0.05, 0.02],
+            surface_tension_cross: 0.03,
+            bounds_size: Vec3::new(cylinder_r * 2.0 + 1.0, half_height * 2.0 + 1.0, cylinder_r * 2.0 + 1.0),
+            render_radius: 0.1,
+            initial_velocity: Vec3::ZERO,
+            spawn: SpawnSettings3D {
+                spawn_density: 72,
+                jitter_strength: 0.03,
+                cylinder_clip_radius: cylinder_r * 0.92,
+                regions,
             },
         }
     }
@@ -1239,6 +1618,7 @@ impl SimulationSettings3D {
 struct SpawnSettings3D {
     spawn_density: usize,
     jitter_strength: f32,
+    cylinder_clip_radius: f32,
     regions: Vec<SpawnRegion3D>,
 }
 
@@ -1246,38 +1626,55 @@ struct SpawnSettings3D {
 struct SpawnRegion3D {
     centre: Vec3,
     size: f32,
+    height_override: f32,
+    fluid_type: u8,
 }
 
 struct SpawnData3D {
     positions: Vec<Vec3>,
+    fluid_types: Vec<u8>,
 }
 
 fn build_spawn_points_3d(settings: &SpawnSettings3D) -> SpawnData3D {
     let mut rng = SimpleRng::new(7);
     let mut positions = Vec::new();
+    let mut fluid_types = Vec::new();
 
     for region in &settings.regions {
-        let particles_per_axis =
+        let height = if region.height_override > 0.0 {
+            region.height_override
+        } else {
+            region.size
+        };
+        let xz_count =
             calculate_spawn_count_per_axis_3d(region.size, settings.spawn_density);
-        for z in 0..particles_per_axis {
-            for y in 0..particles_per_axis {
-                for x in 0..particles_per_axis {
-                    let tx = coordinate_t(x, particles_per_axis);
-                    let ty = coordinate_t(y, particles_per_axis);
-                    let tz = coordinate_t(z, particles_per_axis);
+        let y_count = ((height / region.size) * xz_count as f32).ceil().max(1.0) as usize;
+        for z in 0..xz_count {
+            for y in 0..y_count {
+                for x in 0..xz_count {
+                    let tx = coordinate_t(x, xz_count);
+                    let ty = coordinate_t(y, y_count);
+                    let tz = coordinate_t(z, xz_count);
                     let position = Vec3::new(
                         (tx - 0.5) * region.size + region.centre.x,
-                        (ty - 0.5) * region.size + region.centre.y,
+                        (ty - 0.5) * height + region.centre.y,
                         (tz - 0.5) * region.size + region.centre.z,
                     );
                     let jitter = random_in_unit_sphere(&mut rng) * settings.jitter_strength;
-                    positions.push(position + jitter);
+                    let p = position + jitter;
+                    if settings.cylinder_clip_radius > 0.0
+                        && (p.x * p.x + p.z * p.z).sqrt() > settings.cylinder_clip_radius
+                    {
+                        continue;
+                    }
+                    positions.push(p);
+                    fluid_types.push(region.fluid_type);
                 }
             }
         }
     }
 
-    SpawnData3D { positions }
+    SpawnData3D { positions, fluid_types }
 }
 
 fn calculate_spawn_count_per_axis_3d(size: f32, spawn_density: usize) -> usize {

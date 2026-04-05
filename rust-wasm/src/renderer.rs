@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::mem::size_of;
 
 use bytemuck::{Pod, Zeroable};
-use js_sys::{Array, Promise};
+use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use web_sys::HtmlCanvasElement;
 
@@ -148,11 +148,20 @@ fn vs_main(input: ParticleVertexInput) -> ParticleVertexOutput {
     return output;
 }
 
-fn palette(colour_t: f32) -> vec3<f32> {
+const FLUID_TYPE_PACK_3D: f32 = 1024.0;
+
+fn water_palette_3d(t: f32) -> vec3<f32> {
     let base = vec3<f32>(0.07, 0.20, 0.47);
     let mid = vec3<f32>(0.10, 0.47, 0.74);
     let crest = vec3<f32>(0.87, 0.95, 0.98);
-    return mix(mix(base, mid, clamp(colour_t, 0.0, 1.0)), crest, clamp(colour_t * 0.6, 0.0, 1.0));
+    return mix(mix(base, mid, clamp(t, 0.0, 1.0)), crest, clamp(t * 0.6, 0.0, 1.0));
+}
+
+fn oil_palette_3d(t: f32) -> vec3<f32> {
+    let base = vec3<f32>(0.35, 0.20, 0.05);
+    let mid = vec3<f32>(0.65, 0.45, 0.10);
+    let crest = vec3<f32>(0.95, 0.85, 0.40);
+    return mix(mix(base, mid, clamp(t, 0.0, 1.0)), crest, clamp(t * 0.6, 0.0, 1.0));
 }
 
 @fragment
@@ -161,6 +170,9 @@ fn fs_main(input: ParticleVertexOutput) -> @location(0) vec4<f32> {
     if (radial > 1.0) {
         discard;
     }
+
+    let fluid_type = floor(input.colour_t / FLUID_TYPE_PACK_3D);
+    let density_t = input.colour_t - fluid_type * FLUID_TYPE_PACK_3D;
 
     let sphere_z = sqrt(max(1.0 - radial, 0.0));
     let normal = normalize(
@@ -171,7 +183,8 @@ fn fs_main(input: ParticleVertexOutput) -> @location(0) vec4<f32> {
     let light = normalize(-uniforms.light_dir.xyz);
     let diffuse = max(dot(normal, light), 0.0);
     let rim = pow(1.0 - sphere_z, 2.5);
-    let color = palette(input.colour_t) * (0.34 + diffuse * 0.9) + vec3<f32>(rim * 0.12);
+    let base_color = select(oil_palette_3d(density_t), water_palette_3d(density_t), fluid_type < 0.5);
+    let color = base_color * (0.34 + diffuse * 0.9) + vec3<f32>(rim * 0.12);
     let alpha = smoothstep(1.0, 0.82, radial);
     return vec4<f32>(color, alpha);
 }
@@ -358,14 +371,29 @@ impl WasmFluidApp {
                     .await
                     .map_err(|error| JsValue::from_str(&error))?;
 
-            Ok(Array::of4(
+            let speed_sq_bits = diagnostics.max_speed_sq_bits;
+            Ok(js_sys::Array::of5(
                 &JsValue::from_f64(diagnostics.peak_cell_occupancy as f64),
                 &JsValue::from_f64(diagnostics.dropped_particles as f64),
                 &JsValue::from_f64(diagnostics.overflowed_cells as f64),
                 &JsValue::from_f64(capacity as f64),
+                &JsValue::from_f64(speed_sq_bits as f64),
             )
             .into())
         })
+    }
+
+    #[wasm_bindgen(js_name = updateMaxSpeed)]
+    pub fn update_max_speed(&mut self, speed_sq_bits: u32) {
+        let speed_sq = f32::from_bits(speed_sq_bits);
+        if speed_sq.is_finite() {
+            self.simulation.update_max_speed(&crate::gpu_sim::SimulationDiagnostics {
+                peak_cell_occupancy: 0,
+                dropped_particles: 0,
+                overflowed_cells: 0,
+                max_speed_sq_bits: speed_sq_bits,
+            });
+        }
     }
 
     #[wasm_bindgen(js_name = boundsWidth)]
@@ -510,14 +538,52 @@ impl WasmFluid3DApp {
                     .await
                     .map_err(|error| JsValue::from_str(&error))?;
 
-            Ok(Array::of4(
+            let speed_sq_bits = diagnostics.max_speed_sq_bits;
+            Ok(js_sys::Array::of5(
                 &JsValue::from_f64(diagnostics.peak_cell_occupancy as f64),
                 &JsValue::from_f64(diagnostics.dropped_particles as f64),
                 &JsValue::from_f64(diagnostics.overflowed_cells as f64),
                 &JsValue::from_f64(capacity as f64),
+                &JsValue::from_f64(speed_sq_bits as f64),
             )
             .into())
         })
+    }
+
+    #[wasm_bindgen(js_name = updateMaxSpeed)]
+    pub fn update_max_speed(&mut self, speed_sq_bits: u32) {
+        let speed_sq = f32::from_bits(speed_sq_bits);
+        if speed_sq.is_finite() {
+            self.simulation.update_max_speed(&crate::gpu_sim_3d::SimulationDiagnostics3D {
+                peak_cell_occupancy: 0,
+                dropped_particles: 0,
+                overflowed_cells: 0,
+                max_speed_sq_bits: speed_sq_bits,
+            });
+        }
+    }
+
+    #[wasm_bindgen(js_name = readRenderData)]
+    pub fn read_render_data(&self) -> Promise {
+        let device = self.renderer.device().clone();
+        let queue = self.renderer.queue().clone();
+        let render_buffer = self.simulation.render_buffer().clone();
+        let count = self.simulation.particle_count();
+
+        wasm_bindgen_futures::future_to_promise(async move {
+            let data =
+                GpuFluidSimulation3D::read_render_data(&device, &queue, &render_buffer, count)
+                    .await
+                    .map_err(|error| JsValue::from_str(&error))?;
+            let array = js_sys::Float32Array::new_with_length(data.len() as u32);
+            array.copy_from(&data);
+            Ok(array.into())
+        })
+    }
+
+    #[wasm_bindgen(js_name = boundsHeight)]
+    pub fn bounds_height(&self) -> f32 {
+        self.simulation.settings().bounds_size.y
     }
 
     #[wasm_bindgen(js_name = presetName)]

@@ -79,10 +79,24 @@ h1 {
   margin: 1.5rem 0;
 }
 
-.preset-picker {
+.preset-picker,
+.speed-control {
   display: grid;
   gap: 0.45rem;
   margin-bottom: 1.4rem;
+}
+
+.speed-control span {
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.speed-control input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
 }
 
 .preset-picker span {
@@ -146,6 +160,19 @@ dd {
 .viewer {
   min-height: 70vh;
   padding: 1rem;
+  position: relative;
+}
+
+#density-chart {
+  display: none;
+  position: absolute;
+  right: 1.5rem;
+  top: 1.5rem;
+  width: 100px;
+  height: 300px;
+  border-radius: 0.5rem;
+  background: rgba(255, 255, 255, 0.75);
+  backdrop-filter: blur(8px);
 }
 
 #fluid-canvas {

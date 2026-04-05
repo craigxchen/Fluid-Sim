@@ -14,6 +14,10 @@ const rendererLabel = document.getElementById("renderer");
 const gridPeakLabel = document.getElementById("grid-peak");
 const gridDropsLabel = document.getElementById("grid-drops");
 const hintLabel = document.getElementById("mode-hint");
+const speedSlider = document.getElementById("speed-slider");
+const speedLabel = document.getElementById("speed-label");
+const densityChart = document.getElementById("density-chart");
+const densityCtx = densityChart.getContext("2d");
 
 const MODE_2D = "2d";
 const MODE_3D = "3d";
@@ -35,6 +39,8 @@ let simCpuWindow = [];
 let renderCpuWindow = [];
 let diagnosticsInFlight = false;
 let lastDiagnosticsSample = 0;
+let densityChartInFlight = false;
+let lastDensityChartSample = 0;
 
 function is3dMode() {
   return activeMode === MODE_3D;
@@ -131,16 +137,102 @@ async function pollDiagnostics(force = false) {
   lastDiagnosticsSample = now;
 
   try {
-    const [peak, dropped, overflowedCells, capacity] = (
-      await app.readDiagnostics()
-    ).map((value) => Number(value));
+    const values = (await app.readDiagnostics()).map((value) => Number(value));
+    const [peak, dropped, overflowedCells, capacity] = values;
     gridPeakLabel.textContent = `${peak} / ${capacity}`;
     gridDropsLabel.textContent =
       dropped > 0 ? `${dropped} (${overflowedCells} cells)` : "0";
+    if (values.length > 4 && app.updateMaxSpeed) {
+      app.updateMaxSpeed(values[4]);
+    }
   } catch (error) {
     console.error("Failed to sample GPU diagnostics", error);
   } finally {
     diagnosticsInFlight = false;
+  }
+}
+
+const DENSITY_BINS = 20;
+const FLUID_TYPE_PACK_3D = 1024.0;
+
+function drawDensityChart(waterCounts, oilCounts) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = densityChart.clientWidth;
+  const h = densityChart.clientHeight;
+  densityChart.width = Math.round(w * dpr);
+  densityChart.height = Math.round(h * dpr);
+  densityCtx.scale(dpr, dpr);
+
+  densityCtx.clearRect(0, 0, w, h);
+
+  const pad = 4;
+  const barH = (h - pad * 2) / DENSITY_BINS;
+  const maxCount = Math.max(
+    1,
+    ...waterCounts.map((wc, i) => wc + oilCounts[i]),
+  );
+
+  for (let i = 0; i < DENSITY_BINS; i++) {
+    const y = pad + i * barH;
+    const total = waterCounts[i] + oilCounts[i];
+    const barW = (total / maxCount) * (w - pad * 2 - 20);
+    const waterW = total > 0 ? (waterCounts[i] / total) * barW : 0;
+    const oilW = barW - waterW;
+
+    densityCtx.fillStyle = "rgba(30, 120, 180, 0.7)";
+    densityCtx.fillRect(pad + 16, y + 1, waterW, barH - 2);
+
+    densityCtx.fillStyle = "rgba(180, 130, 30, 0.7)";
+    densityCtx.fillRect(pad + 16 + waterW, y + 1, oilW, barH - 2);
+  }
+
+  densityCtx.fillStyle = "#496377";
+  densityCtx.font = "9px monospace";
+  densityCtx.textAlign = "right";
+  densityCtx.fillText("top", pad + 13, pad + 8);
+  densityCtx.fillText("bot", pad + 13, h - pad);
+}
+
+async function pollDensityChart() {
+  if (!app || !is3dMode() || densityChartInFlight || !app.readRenderData) {
+    return;
+  }
+
+  const now = performance.now();
+  if (now - lastDensityChartSample < 500) {
+    return;
+  }
+
+  densityChartInFlight = true;
+  lastDensityChartSample = now;
+
+  try {
+    const data = await app.readRenderData();
+    const halfH = app.boundsHeight() * 0.5;
+    const waterCounts = new Array(DENSITY_BINS).fill(0);
+    const oilCounts = new Array(DENSITY_BINS).fill(0);
+
+    for (let i = 0; i < data.length; i += 4) {
+      const y = data[i + 1];
+      const packed = data[i + 3];
+      const ft = Math.floor(packed / FLUID_TYPE_PACK_3D);
+      const bin = Math.min(
+        DENSITY_BINS - 1,
+        Math.max(0, Math.floor(((halfH - y) / (halfH * 2)) * DENSITY_BINS)),
+      );
+
+      if (ft < 0.5) {
+        waterCounts[bin]++;
+      } else {
+        oilCounts[bin]++;
+      }
+    }
+
+    drawDensityChart(waterCounts, oilCounts);
+  } catch (error) {
+    console.error("Failed to read render data", error);
+  } finally {
+    densityChartInFlight = false;
   }
 }
 
@@ -155,7 +247,8 @@ function animate(timestamp) {
 
   const simStart = performance.now();
   if (!paused) {
-    app.stepFrame(frameTime);
+    const speed = Math.pow(2, Number(speedSlider.value));
+    app.stepFrame(frameTime * speed);
   }
   updateCpuMetric(simCpuLabel, simCpuWindow, performance.now() - simStart);
 
@@ -163,6 +256,7 @@ function animate(timestamp) {
   app.render();
   updateCpuMetric(renderCpuLabel, renderCpuWindow, performance.now() - renderStart);
   void pollDiagnostics();
+  void pollDensityChart();
   requestAnimationFrame(animate);
 }
 
@@ -221,6 +315,8 @@ function syncUi() {
   modeSelect.value = activeMode;
   rendererLabel.textContent = app.rendererName();
 
+  densityChart.style.display = is3dMode() ? "block" : "none";
+
   if (is3dMode()) {
     gridPeakLabel.textContent = `0 / ${app.maxParticlesPerCell()}`;
     gridDropsLabel.textContent = "0";
@@ -276,6 +372,13 @@ window.addEventListener("pointerup", () => {
   }
 });
 window.addEventListener("resize", resizeCanvas);
+
+speedSlider.addEventListener("input", () => {
+  const speed = Math.pow(2, Number(speedSlider.value));
+  speedLabel.textContent = speed < 1
+    ? `${speed.toFixed(2)}x`
+    : `${Math.round(speed * 10) / 10}x`;
+});
 
 toggleButton.addEventListener("click", () => {
   paused = !paused;

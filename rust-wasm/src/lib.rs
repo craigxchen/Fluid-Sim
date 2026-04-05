@@ -256,6 +256,7 @@ impl FluidSimulation {
         self.calculate_densities();
         self.apply_pressure_forces(delta_time);
         self.apply_viscosity(delta_time);
+        self.apply_surface_tension(delta_time);
         self.update_positions(delta_time);
     }
 
@@ -375,8 +376,9 @@ impl FluidSimulation {
                 let sqr_dst = to_neighbour.length_squared();
                 if sqr_dst <= radius_sq {
                     let dst = sqr_dst.sqrt();
-                    density += spiky_kernel_pow2(dst, self.settings.smoothing_radius);
-                    near_density += spiky_kernel_pow3(dst, self.settings.smoothing_radius);
+                    let mass = self.settings.fluid_mass(self.fluid_types[current]);
+                    density += mass * spiky_kernel_pow2(dst, self.settings.smoothing_radius);
+                    near_density += mass * spiky_kernel_pow3(dst, self.settings.smoothing_radius);
                 }
                 current += 1;
             }
@@ -387,18 +389,19 @@ impl FluidSimulation {
 
     fn apply_pressure_forces(&mut self, delta_time: f32) {
         let particle_count = self.positions.len();
+        let radius = self.settings.smoothing_radius;
+        let radius_sq = radius * radius;
         self.velocity_scratch.clone_from(&self.velocities);
 
         for index in 0..particle_count {
-            let density = self.densities[index].x.max(EPSILON);
-            let near_density = self.densities[index].y.max(EPSILON);
             let my_type = self.fluid_types[index];
-            let my_props = self.settings.fluid_type_props(my_type);
-            let pressure = pressure_from_density(density, my_props.target_density, my_props.pressure_multiplier);
-            let near_pressure = my_props.near_pressure_multiplier * near_density;
+            let my_density = self.densities[index].x.max(EPSILON);
+            let my_near_density = self.densities[index].y;
+            let my_target = self.settings.fluid_type_props(my_type).target_density;
+            let pressure = (my_density - my_target) * self.settings.fluid_type_props(my_type).pressure_multiplier;
+            let near_pressure = self.settings.fluid_type_props(my_type).near_pressure_multiplier * my_near_density;
             let position = self.predicted_positions[index];
-            let origin = get_cell(position, self.settings.smoothing_radius);
-            let radius_sq = self.settings.smoothing_radius * self.settings.smoothing_radius;
+            let origin = get_cell(position, radius);
             let mut pressure_force = Vec2::ZERO;
 
             for offset in NEIGHBOUR_OFFSETS {
@@ -421,54 +424,42 @@ impl FluidSimulation {
                     let neighbour_pos = self.predicted_positions[current];
                     let to_neighbour = neighbour_pos - position;
                     let sqr_dst = to_neighbour.length_squared();
-                    if sqr_dst > radius_sq {
-                        current += 1;
-                        continue;
-                    }
+                    if sqr_dst <= radius_sq {
+                        let dst = sqr_dst.sqrt();
+                        let dir = if dst > EPSILON {
+                            to_neighbour / dst
+                        } else {
+                            Vec2::new(0.0, 1.0)
+                        };
+                        let nt = self.fluid_types[current];
+                        let mass = self.settings.fluid_mass(nt);
+                        let nd = self.densities[current].x.max(EPSILON);
+                        let n_near_density = self.densities[current].y;
+                        let nt_props = self.settings.fluid_type_props(nt);
+                        let n_pressure = (nd - nt_props.target_density) * nt_props.pressure_multiplier;
+                        let n_near_pressure = nt_props.near_pressure_multiplier * n_near_density;
+                        let ratio = nt_props.target_density / my_target.max(EPSILON);
 
-                    let dst = sqr_dst.sqrt();
-                    let direction = if dst > EPSILON {
-                        to_neighbour / dst
-                    } else {
-                        Vec2::new(0.0, 1.0)
-                    };
+                        pressure_force += dir
+                            * (0.5
+                                * mass
+                                * (pressure / (my_density * my_density)
+                                    + ratio * n_pressure / (nd * nd))
+                                * derivative_spiky_pow2(dst, radius));
 
-                    let neighbour_type = self.fluid_types[current];
-                    let neighbour_props = self.settings.fluid_type_props(neighbour_type);
-                    let neighbour_density = self.densities[current].x.max(EPSILON);
-                    let neighbour_near_density = self.densities[current].y.max(EPSILON);
-                    let neighbour_pressure = pressure_from_density(
-                        neighbour_density,
-                        neighbour_props.target_density,
-                        neighbour_props.pressure_multiplier,
-                    );
-                    let neighbour_near_pressure =
-                        neighbour_props.near_pressure_multiplier * neighbour_near_density;
-
-                    let shared_pressure = (pressure + neighbour_pressure) * 0.5;
-                    let shared_near_pressure = (near_pressure + neighbour_near_pressure) * 0.5;
-
-                    pressure_force += direction
-                        * derivative_spiky_pow2(dst, self.settings.smoothing_radius)
-                        * shared_pressure
-                        / neighbour_density;
-                    pressure_force += direction
-                        * derivative_spiky_pow3(dst, self.settings.smoothing_radius)
-                        * shared_near_pressure
-                        / neighbour_near_density;
-
-                    if my_type != neighbour_type {
-                        let immiscibility = self.settings.immiscibility_strength
-                            * derivative_spiky_pow2(dst, self.settings.smoothing_radius)
-                            / neighbour_density;
-                        pressure_force += direction * immiscibility;
+                        pressure_force += dir
+                            * (0.5
+                                * mass
+                                * (near_pressure / (my_density * my_density)
+                                    + ratio * n_near_pressure / (nd * nd))
+                                * derivative_spiky_pow3(dst, radius));
                     }
 
                     current += 1;
                 }
             }
 
-            self.velocity_scratch[index] += pressure_force / density * delta_time;
+            self.velocity_scratch[index] += pressure_force * delta_time;
         }
 
         std::mem::swap(&mut self.velocities, &mut self.velocity_scratch);
@@ -515,9 +506,11 @@ impl FluidSimulation {
                         } else {
                             my_viscosity * 0.1
                         };
+                        let mass = self.settings.fluid_mass(neighbour_type);
                         viscosity_force += (self.velocities[current] - velocity)
                             * smoothing_kernel_poly6(dst, self.settings.smoothing_radius)
-                            * viscosity;
+                            * viscosity
+                            * mass;
                     }
 
                     current += 1;
@@ -528,6 +521,85 @@ impl FluidSimulation {
         }
 
         std::mem::swap(&mut self.velocities, &mut self.velocity_scratch);
+    }
+
+    fn apply_surface_tension(&mut self, delta_time: f32) {
+        let particle_count = self.positions.len();
+        let radius = self.settings.smoothing_radius;
+        let radius_sq = radius * radius;
+
+        for index in 0..particle_count {
+            let my_type = self.fluid_types[index];
+            let my_mass = self.settings.fluid_mass(my_type);
+            let my_density = self.densities[index].x.max(EPSILON);
+            let position = self.predicted_positions[index];
+            let origin = get_cell(position, radius);
+            let mut cohesion_force = Vec2::ZERO;
+            let mut normal = Vec2::ZERO;
+
+            for offset in NEIGHBOUR_OFFSETS {
+                let hash = hash_cell((origin.0 + offset.0, origin.1 + offset.1));
+                let key = hash % particle_count.max(1) as u32;
+                let mut current = self.spatial_offsets[key as usize];
+                if current == usize::MAX {
+                    continue;
+                }
+
+                while current < particle_count {
+                    if self.spatial_keys[current] != key {
+                        break;
+                    }
+                    if current == index {
+                        current += 1;
+                        continue;
+                    }
+
+                    let neighbour_pos = self.predicted_positions[current];
+                    let to_neighbour = neighbour_pos - position;
+                    let sqr_dst = to_neighbour.length_squared();
+                    if sqr_dst > radius_sq {
+                        current += 1;
+                        continue;
+                    }
+
+                    let dst = sqr_dst.sqrt();
+                    let neighbour_type = self.fluid_types[current];
+                    let neighbour_mass = self.settings.fluid_mass(neighbour_type);
+                    let neighbour_density = self.densities[current].x.max(EPSILON);
+                    let gamma = self.settings.surface_tension_gamma(my_type, neighbour_type);
+
+                    if gamma > 0.0 {
+                        let k_correction = 2.0 * self.settings.target_density
+                            / (my_density + neighbour_density).max(EPSILON);
+                        let direction = if dst > EPSILON {
+                            to_neighbour / dst
+                        } else {
+                            Vec2::new(0.0, 1.0)
+                        };
+
+                        cohesion_force = cohesion_force - direction
+                            * gamma
+                            * my_mass
+                            * neighbour_mass
+                            * akinci_cohesion_kernel(dst, radius)
+                            * k_correction;
+
+                        normal += direction
+                            * radius
+                            * (neighbour_mass / neighbour_density)
+                            * derivative_spiky_pow2(dst, radius);
+                    }
+
+                    current += 1;
+                }
+            }
+
+            let gamma_self = self.settings.surface_tension_gamma(my_type, my_type);
+            if normal.length_squared() > EPSILON && gamma_self > 0.0 {
+                self.velocities[index] = self.velocities[index] - normal * gamma_self * delta_time;
+            }
+            self.velocities[index] += cohesion_force * delta_time;
+        }
     }
 
     fn update_positions(&mut self, delta_time: f32) {
@@ -609,6 +681,8 @@ struct SimulationSettings {
     viscosity_strength: f32,
     immiscibility_strength: f32,
     fluid_type_properties: Vec<FluidTypeProperties>,
+    surface_tension_same: [f32; 2],
+    surface_tension_cross: f32,
     bounds_size: Vec2,
     obstacle: Obstacle,
     interaction_radius: f32,
@@ -636,6 +710,18 @@ impl SimulationSettings {
             3 => "Oil & Water",
             _ => "Unknown Preset",
         }
+    }
+
+    fn surface_tension_gamma(&self, ft_a: u8, ft_b: u8) -> f32 {
+        if ft_a == ft_b {
+            self.surface_tension_same[ft_a.min(1) as usize]
+        } else {
+            self.surface_tension_cross
+        }
+    }
+
+    fn fluid_mass(&self, fluid_type: u8) -> f32 {
+        self.fluid_type_props(fluid_type).target_density / self.target_density.max(EPSILON)
     }
 
     fn fluid_type_props(&self, fluid_type: u8) -> FluidTypeProperties {
@@ -674,6 +760,8 @@ impl SimulationSettings {
             viscosity_strength: 0.03,
             immiscibility_strength: 0.0,
             fluid_type_properties: vec![],
+            surface_tension_same: [0.0, 0.0],
+            surface_tension_cross: 0.0,
             bounds_size: Vec2::new(17.1, 9.3),
             obstacle: Obstacle {
                 centre: Vec2::ZERO,
@@ -712,6 +800,8 @@ impl SimulationSettings {
             viscosity_strength: 0.03,
             immiscibility_strength: 0.0,
             fluid_type_properties: vec![],
+            surface_tension_same: [0.0, 0.0],
+            surface_tension_cross: 0.0,
             bounds_size: Vec2::new(17.1, 9.3),
             obstacle: Obstacle {
                 centre: Vec2::new(0.03, -1.0),
@@ -757,6 +847,8 @@ impl SimulationSettings {
             viscosity_strength: 0.0,
             immiscibility_strength: 0.0,
             fluid_type_properties: vec![],
+            surface_tension_same: [0.0, 0.0],
+            surface_tension_cross: 0.0,
             bounds_size: Vec2::new(43.1, 23.86),
             obstacle: Obstacle {
                 centre: Vec2::new(7.5, -8.16),
@@ -811,39 +903,41 @@ impl SimulationSettings {
             immiscibility_strength: 25.0,
             fluid_type_properties: vec![
                 FluidTypeProperties {
-                    target_density: 80.0,       // water: baseline
+                    target_density: 80.0,
                     pressure_multiplier: 500.0,
                     near_pressure_multiplier: 8.0,
-                    viscosity_strength: 0.01,   // water: low viscosity
+                    viscosity_strength: 0.01,
                 },
                 FluidTypeProperties {
-                    target_density: 73.8,       // oil: 80 * 0.923
+                    target_density: 68.0,       // oil: 15% lighter than water
                     pressure_multiplier: 500.0,
                     near_pressure_multiplier: 8.0,
-                    viscosity_strength: 0.08,   // oil: 8x water (real ~70x, capped for stability)
+                    viscosity_strength: 0.08,
                 },
             ],
-            bounds_size: Vec2::new(17.1, 9.3),
+            surface_tension_same: [0.05, 0.02],
+            surface_tension_cross: 0.03,
+            bounds_size: Vec2::new(17.1, 13.0),
             obstacle: Obstacle {
                 centre: Vec2::ZERO,
                 size: Vec2::ZERO,
             },
             interaction_radius: 2.0,
             interaction_strength: 90.0,
-            render_radius: 0.07,
+            render_radius: 0.055,
             spawn: SpawnSettings {
-                spawn_density: 200.0,
+                spawn_density: 400.0,
                 initial_velocity: Vec2::ZERO,
                 jitter_strength: 0.03,
                 regions: vec![
                     SpawnRegion {
-                        position: Vec2::new(0.0, -1.5),
-                        size: Vec2::new(12.0, 4.0),
+                        position: Vec2::new(0.0, -2.0),
+                        size: Vec2::new(11.0, 3.5),
                         fluid_type: 0,
                     },
                     SpawnRegion {
-                        position: Vec2::new(0.0, 2.5),
-                        size: Vec2::new(12.0, 4.0),
+                        position: Vec2::new(0.0, 2.0),
+                        size: Vec2::new(11.0, 3.5),
                         fluid_type: 1,
                     },
                 ],
@@ -1021,8 +1115,18 @@ impl std::ops::Div<f32> for Vec2 {
     }
 }
 
-fn pressure_from_density(density: f32, target_density: f32, pressure_multiplier: f32) -> f32 {
-    (density - target_density) * pressure_multiplier
+fn akinci_cohesion_kernel(distance: f32, radius: f32) -> f32 {
+    if distance >= radius || distance <= 0.0 {
+        return 0.0;
+    }
+    let coeff = 32.0 / (PI * radius.powi(9));
+    let half_r = radius * 0.5;
+    let d = radius - distance;
+    if distance > half_r {
+        coeff * d * d * d * distance * distance * distance
+    } else {
+        coeff * (2.0 * d * d * d * distance * distance * distance - radius.powi(6) / 64.0)
+    }
 }
 
 fn smoothing_kernel_poly6(distance: f32, radius: f32) -> f32 {

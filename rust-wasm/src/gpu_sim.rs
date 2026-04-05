@@ -178,16 +178,33 @@ fn fluid_viscosity(ft: u32) -> f32 {
     return select(uniforms.fluid_type1.w, uniforms.fluid_type0.w, ft == 0u);
 }
 
+fn fluid_mass(ft: u32) -> f32 {
+    return fluid_target_density(ft) / max(uniforms.fluid_type0.x, EPSILON);
+}
+
 fn immiscibility_strength() -> f32 {
     return uniforms.multi_fluid.x;
 }
 
-fn pressure_from_density(density: f32, ft: u32) -> f32 {
-    return (density - fluid_target_density(ft)) * fluid_pressure_mult(ft);
+fn surface_tension_gamma(ft_a: u32, ft_b: u32) -> f32 {
+    if (ft_a == ft_b) {
+        return select(uniforms.multi_fluid.z, uniforms.multi_fluid.y, ft_a == 0u);
+    }
+    return uniforms.multi_fluid.w;
 }
 
-fn near_pressure_from_density(near_density: f32, ft: u32) -> f32 {
-    return fluid_near_pressure_mult(ft) * near_density;
+fn akinci_cohesion_kernel_2d(distance: f32, radius: f32) -> f32 {
+    if (distance >= radius || distance <= 0.0) {
+        return 0.0;
+    }
+    let coeff = 32.0 / (3.141592653589793 * pow(radius, 9.0));
+    let half_r = radius * 0.5;
+    if (distance > half_r) {
+        let d = radius - distance;
+        return coeff * d * d * d * distance * distance * distance;
+    }
+    let d = radius - distance;
+    return coeff * (2.0 * d * d * d * distance * distance * distance - pow(radius, 6.0) / 64.0);
 }
 
 fn external_force(position: vec2<f32>, velocity: vec2<f32>) -> vec2<f32> {
@@ -241,8 +258,9 @@ fn calculate_density(position: vec2<f32>) -> vec2<f32> {
             }
 
             let distance = sqrt(sqr_dst);
-            density += spiky_kernel_pow2(distance, radius);
-            near_density += spiky_kernel_pow3(distance, radius);
+            let mass = fluid_mass(get_fluid_type(neighbour_index));
+            density += mass * spiky_kernel_pow2(distance, radius);
+            near_density += mass * spiky_kernel_pow3(distance, radius);
         }
     }
 
@@ -356,10 +374,13 @@ fn calculate_pressure(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let my_type = get_fluid_type(index);
-    let density = max(densities[index].x, EPSILON);
-    let near_density = max(densities[index].y, EPSILON);
-    let pressure = pressure_from_density(density, my_type);
-    let near_pressure = near_pressure_from_density(near_density, my_type);
+    let my_density = max(densities[index].x, EPSILON);
+    let my_near_density = densities[index].y;
+    let my_target = fluid_target_density(my_type);
+    let my_mass = fluid_mass(my_type);
+    let pressure = (my_density - my_target) * fluid_pressure_mult(my_type);
+    let near_pressure = fluid_near_pressure_mult(my_type) * my_near_density;
+
     let position = predicted_positions[index];
     let origin = get_cell(position);
     let radius = smoothing_radius();
@@ -393,32 +414,24 @@ fn calculate_pressure(@builtin(global_invocation_id) id: vec3<u32>) {
             let distance = sqrt(sqr_dst);
             let direction = select(vec2<f32>(0.0, 1.0), offset_to_neighbour / max(distance, EPSILON), distance > EPSILON);
             let neighbour_type = get_fluid_type(neighbour_index);
+            let mass = fluid_mass(neighbour_type);
             let neighbour_density = max(densities[neighbour_index].x, EPSILON);
-            let neighbour_near_density = max(densities[neighbour_index].y, EPSILON);
-            let neighbour_pressure = pressure_from_density(neighbour_density, neighbour_type);
-            let neighbour_near_pressure = near_pressure_from_density(neighbour_near_density, neighbour_type);
-            let shared_pressure = (pressure + neighbour_pressure) * 0.5;
-            let shared_near_pressure = (near_pressure + neighbour_near_pressure) * 0.5;
+            let neighbour_near_density = densities[neighbour_index].y;
+            let neighbour_pressure = (neighbour_density - fluid_target_density(neighbour_type)) * fluid_pressure_mult(neighbour_type);
+            let neighbour_near_pressure = fluid_near_pressure_mult(neighbour_type) * neighbour_near_density;
+            let density_ratio = fluid_target_density(neighbour_type) / max(my_target, EPSILON);
 
-            pressure_force += direction
-                * derivative_spiky_pow2(distance, radius)
-                * shared_pressure
-                / neighbour_density;
-            pressure_force += direction
-                * derivative_spiky_pow3(distance, radius)
-                * shared_near_pressure
-                / neighbour_near_density;
+            pressure_force += 0.5 * mass
+                * (pressure / (my_density * my_density) + density_ratio * neighbour_pressure / (neighbour_density * neighbour_density))
+                * derivative_spiky_pow2(distance, radius) * direction;
 
-            if (my_type != neighbour_type) {
-                let immiscibility = immiscibility_strength()
-                    * derivative_spiky_pow2(distance, radius)
-                    / neighbour_density;
-                pressure_force += direction * immiscibility;
-            }
+            pressure_force += 0.5 * mass
+                * (near_pressure / (my_density * my_density) + density_ratio * neighbour_near_pressure / (neighbour_density * neighbour_density))
+                * derivative_spiky_pow3(distance, radius) * direction;
         }
     }
 
-    velocities_scratch[index] = velocities[index] + pressure_force / density * uniforms.step0.y;
+    velocities_scratch[index] = velocities[index] + pressure_force * uniforms.step0.y;
 }
 
 @compute @workgroup_size(64)
@@ -464,12 +477,89 @@ fn calculate_viscosity(@builtin(global_invocation_id) id: vec3<u32>) {
             let distance = sqrt(sqr_dst);
             let neighbour_type = get_fluid_type(neighbour_index);
             let viscosity = select(my_viscosity * 0.1, my_viscosity, my_type == neighbour_type);
+            let mass = fluid_mass(neighbour_type);
             viscosity_force +=
-                (velocities_scratch[neighbour_index] - velocity) * smoothing_kernel_poly6(distance, radius) * viscosity;
+                (velocities_scratch[neighbour_index] - velocity)
+                * smoothing_kernel_poly6(distance, radius) * viscosity * mass;
         }
     }
 
     velocities[index] = velocity + viscosity_force * uniforms.step0.y;
+}
+
+@compute @workgroup_size(64)
+fn calculate_surface_tension(@builtin(global_invocation_id) id: vec3<u32>) {
+    let index = id.x;
+    if (index >= num_particles()) {
+        return;
+    }
+
+    let my_type = get_fluid_type(index);
+    let my_mass = fluid_mass(my_type);
+    let my_density = max(densities[index].x, EPSILON);
+    let position = predicted_positions[index];
+    let origin = get_cell(position);
+    let radius = smoothing_radius();
+    let radius_sq = radius * radius;
+    var cohesion_force = vec2<f32>(0.0, 0.0);
+    var normal = vec2<f32>(0.0, 0.0);
+
+    for (var offset_index = 0u; offset_index < 9u; offset_index += 1u) {
+        let neighbour_cell = origin + NEIGHBOUR_OFFSETS[offset_index];
+        if (!cell_is_valid(neighbour_cell)) {
+            continue;
+        }
+
+        let cell_index = flat_cell_index(neighbour_cell);
+        let count = min(
+            atomicLoad(&grid_state[grid_cell_count_index(cell_index)]),
+            max_particles_per_cell(),
+        );
+        for (var slot = 0u; slot < count; slot += 1u) {
+            let neighbour_index = cell_particles[cell_index * max_particles_per_cell() + slot];
+            if (neighbour_index == index) {
+                continue;
+            }
+
+            let neighbour_position = predicted_positions[neighbour_index];
+            let offset_to_neighbour = neighbour_position - position;
+            let sqr_dst = dot(offset_to_neighbour, offset_to_neighbour);
+            if (sqr_dst > radius_sq) {
+                continue;
+            }
+
+            let distance = sqrt(sqr_dst);
+            let neighbour_type = get_fluid_type(neighbour_index);
+            let neighbour_mass = fluid_mass(neighbour_type);
+            let neighbour_density = max(densities[neighbour_index].x, EPSILON);
+            let gamma = surface_tension_gamma(my_type, neighbour_type);
+
+            if (gamma <= 0.0) {
+                continue;
+            }
+
+            let K = 2.0 * target_density() / max(my_density + neighbour_density, EPSILON);
+            let direction = select(
+                vec2<f32>(0.0, 1.0),
+                offset_to_neighbour / max(distance, EPSILON),
+                distance > EPSILON,
+            );
+
+            cohesion_force -= gamma * my_mass * neighbour_mass
+                * akinci_cohesion_kernel_2d(distance, radius) * direction * K;
+
+            normal += radius * (neighbour_mass / neighbour_density)
+                * derivative_spiky_pow2(distance, radius) * direction;
+        }
+    }
+
+    var curvature_force = vec2<f32>(0.0, 0.0);
+    let normal_len = length(normal);
+    if (normal_len > EPSILON) {
+        curvature_force = -surface_tension_gamma(my_type, my_type) * normal;
+    }
+
+    velocities[index] = velocities[index] + (cohesion_force + curvature_force) * uniforms.step0.y;
 }
 
 @compute @workgroup_size(64)
@@ -481,6 +571,8 @@ fn update_positions(@builtin(global_invocation_id) id: vec3<u32>) {
 
     positions[index] = positions[index] + velocities[index] * uniforms.step0.y;
     handle_collisions(index);
+    let speed_sq = dot(velocities[index], velocities[index]);
+    atomicMax(&grid_state[3], bitcast<u32>(speed_sq));
 }
 
 @compute @workgroup_size(64)
@@ -524,11 +616,12 @@ pub(crate) struct SimulationDiagnostics {
     pub(crate) peak_cell_occupancy: u32,
     pub(crate) dropped_particles: u32,
     pub(crate) overflowed_cells: u32,
-    _reserved: u32,
+    pub(crate) max_speed_sq_bits: u32,
 }
 
 pub(crate) struct GpuFluidSimulation {
     settings: SimulationSettings,
+    max_speed_sq: f32,
     initial_positions: Vec<[f32; 2]>,
     initial_velocities: Vec<[f32; 2]>,
     initial_fluid_types: Vec<f32>,
@@ -554,6 +647,7 @@ pub(crate) struct GpuFluidSimulation {
     calculate_densities_pipeline: wgpu::ComputePipeline,
     calculate_pressure_pipeline: wgpu::ComputePipeline,
     calculate_viscosity_pipeline: wgpu::ComputePipeline,
+    surface_tension_pipeline: wgpu::ComputePipeline,
     update_positions_pipeline: wgpu::ComputePipeline,
     prepare_render_data_pipeline: wgpu::ComputePipeline,
 }
@@ -690,6 +784,7 @@ impl GpuFluidSimulation {
 
         let mut simulation = Self {
             settings,
+            max_speed_sq: 0.0,
             initial_positions,
             initial_velocities,
             initial_fluid_types,
@@ -745,6 +840,12 @@ impl GpuFluidSimulation {
                 &shader_module,
                 "calculate_viscosity",
             ),
+            surface_tension_pipeline: compute_pipeline(
+                device,
+                &pipeline_layout,
+                &shader_module,
+                "calculate_surface_tension",
+            ),
             update_positions_pipeline: compute_pipeline(
                 device,
                 &pipeline_layout,
@@ -798,6 +899,13 @@ impl GpuFluidSimulation {
 
     pub(crate) fn max_particles_per_cell(&self) -> u32 {
         self.max_particles_per_cell
+    }
+
+    pub(crate) fn update_max_speed(&mut self, diagnostics: &SimulationDiagnostics) {
+        let speed_sq = f32::from_bits(diagnostics.max_speed_sq_bits);
+        if speed_sq.is_finite() {
+            self.max_speed_sq = speed_sq;
+        }
     }
 
     pub(crate) fn render_buffer(&self) -> &wgpu::Buffer {
@@ -882,6 +990,11 @@ impl GpuFluidSimulation {
                 self.encode_pipeline(
                     &mut pass,
                     &self.calculate_viscosity_pipeline,
+                    self.particle_workgroups(),
+                );
+                self.encode_pipeline(
+                    &mut pass,
+                    &self.surface_tension_pipeline,
                     self.particle_workgroups(),
                 );
                 self.encode_pipeline(
@@ -1040,7 +1153,12 @@ impl GpuFluidSimulation {
             kernels1: [12.0 / (PI * radius.powi(4)), 0.0, 0.0, 0.0],
             fluid_type0: fluid_type_uniform(&self.settings, 0),
             fluid_type1: fluid_type_uniform(&self.settings, 1),
-            multi_fluid: [self.settings.immiscibility_strength, 0.0, 0.0, 0.0],
+            multi_fluid: [
+                self.settings.immiscibility_strength,
+                self.settings.surface_tension_same[0],
+                self.settings.surface_tension_same[1],
+                self.settings.surface_tension_cross,
+            ],
         };
 
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
